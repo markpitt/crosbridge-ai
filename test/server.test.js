@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import WebSocket from 'ws';
 
+import { buildPrompt, buildPromptSignature, findLongestExactPrefixMatch } from '../public/lib/prompt-cache.js';
 import { createBridgeServer } from '../src/server.js';
 
 function onceOpen(socket) {
@@ -70,6 +71,77 @@ test('lists the available OpenAI models', async () => {
   await bridgeServer.close();
 });
 
+test('builds prompt transcripts with tool calls and tool outputs', () => {
+  const prompt = buildPrompt([
+    { role: 'system', content: 'You are helpful.' },
+    { role: 'user', content: 'Check memory.' },
+    {
+      role: 'assistant',
+      tool_calls: [
+        {
+          id: 'call_1',
+          type: 'function',
+          function: {
+            name: 'shell',
+            arguments: '{"command":"free -h"}',
+          },
+        },
+      ],
+    },
+    {
+      role: 'tool',
+      name: 'shell',
+      content: 'Mem: 31Gi',
+    },
+  ]);
+
+  assert.match(prompt, /^SYSTEM: You are helpful\./);
+  assert.match(prompt, /USER: Check memory\./);
+  assert.match(prompt, /"type":"tool_calls"/);
+  assert.match(prompt, /"name":"shell"/);
+  assert.match(prompt, /TOOL shell: Mem: 31Gi/);
+});
+
+test('finds the longest exact prompt prefix match', () => {
+  const entries = [
+    {
+      signature: buildPromptSignature([
+        { role: 'user', content: 'First turn' },
+        { role: 'assistant', content: 'First reply' },
+      ]),
+    },
+    {
+      signature: buildPromptSignature([
+        { role: 'system', content: 'You are helpful.' },
+      ]),
+    },
+    {
+      signature: buildPromptSignature([
+        { role: 'user', content: 'First turn' },
+        { role: 'assistant', content: 'First reply' },
+        { role: 'user', content: 'Second turn' },
+        { role: 'assistant', content: 'Second reply' },
+      ]),
+    },
+  ];
+
+  const match = findLongestExactPrefixMatch(
+    entries,
+    [
+      { role: 'user', content: 'First turn' },
+      { role: 'assistant', content: 'First reply' },
+      { role: 'user', content: 'Second turn' },
+      { role: 'assistant', content: 'Second reply' },
+      { role: 'user', content: 'Third turn' },
+    ],
+    2,
+  );
+
+  assert.equal(match.entry, entries[2]);
+  assert.equal(match.prefixMessages, 4);
+  assert.equal(match.suffixMessages, 1);
+});
+
 test('returns a non-streaming OpenAI chat completion from the browser bridge', async () => {
   const bridgeServer = createBridgeServer();
   await bridgeServer.listen(0);
@@ -127,6 +199,90 @@ test('returns a non-streaming OpenAI chat completion from the browser bridge', a
   assert.equal(completionLog.details.stream, false);
   assert.equal(completionLog.details.toolsProvided, 0);
   assert.equal(completionLog.details.completionTokens, 4);
+
+  const closed = onceClose(socket);
+  socket.close();
+  await closed;
+  await bridgeServer.close();
+});
+
+test('records browser prompt-cache metrics in request logs', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  await onceOpen(socket);
+  await readyBridge(socket);
+
+  const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'chrome-prompt-api',
+      messages: [
+        { role: 'user', content: 'First turn' },
+        { role: 'assistant', content: 'First reply' },
+        { role: 'user', content: 'Second turn' },
+      ],
+    }),
+  });
+
+  const generateMessage = await onceMessage(socket, (payload) => payload.type === 'generate');
+  assert.equal(generateMessage.payload.cache.enabled, true);
+  assert.equal(generateMessage.payload.cache.minPrefixMessages, 2);
+
+  socket.send(
+    JSON.stringify({
+      type: 'job-started',
+      requestId: generateMessage.requestId,
+      usage: {
+        prompt_tokens: 7,
+        context_window: 9216,
+        trimmed_messages: 0,
+        cache_hit: true,
+        cache_prefix_messages: 2,
+        cache_suffix_messages: 1,
+        cache_entries: 3,
+      },
+    }),
+  );
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: generateMessage.requestId,
+      text: 'Second reply',
+      usage: {
+        prompt_tokens: 7,
+        completion_tokens: 3,
+        cache_hit: true,
+        cache_prefix_messages: 2,
+        cache_suffix_messages: 1,
+        cache_entries: 4,
+        cache_stored: true,
+      },
+    }),
+  );
+
+  const response = await requestPromise;
+  assert.equal(response.status, 200);
+
+  const statusResponse = await fetch(`http://127.0.0.1:${port}/api/status`);
+  const statusBody = await statusResponse.json();
+  const startLog = statusBody.logs.find((entry) => entry.message === `Browser started request: ${generateMessage.requestId}`);
+  const completionLog = statusBody.logs.find((entry) => entry.message === `Request completed: ${generateMessage.requestId}`);
+
+  assert.equal(startLog.details.cacheHit, true);
+  assert.equal(startLog.details.cachePrefixMessages, 2);
+  assert.equal(startLog.details.cacheSuffixMessages, 1);
+  assert.equal(startLog.details.cacheEntries, 3);
+  assert.equal(completionLog.details.cacheHit, true);
+  assert.equal(completionLog.details.cachePrefixMessages, 2);
+  assert.equal(completionLog.details.cacheSuffixMessages, 1);
+  assert.equal(completionLog.details.cacheEntries, 4);
+  assert.equal(completionLog.details.cacheStored, true);
 
   const closed = onceClose(socket);
   socket.close();
@@ -435,6 +591,8 @@ test('returns OpenAI-style tool calls when tools are provided', async () => {
 
   const generateMessage = await onceMessage(socket, (payload) => payload.type === 'generate');
   assert.match(generateMessage.payload.promptText, /run_shell_command/);
+  assert.equal(generateMessage.payload.cache.enabled, true);
+  assert.equal(generateMessage.payload.cache.awaitServerStore, true);
   socket.send(
     JSON.stringify({
       type: 'job-complete',
@@ -811,6 +969,237 @@ test('retries malformed tool-call-shaped output once before falling back to text
   const retryLog = statusBody.logs.find((entry) => entry.message === `Retrying malformed tool response for ${firstGenerate.requestId}`);
   assert.ok(malformedLog);
   assert.ok(retryLog);
+
+  const closed = onceClose(socket);
+  socket.close();
+  await closed;
+  await bridgeServer.close();
+});
+
+test('recovers escaped stringified tool JSON with local repairs before regenerating', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  await onceOpen(socket);
+  await readyBridge(socket);
+
+  const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'chrome-prompt-api',
+      messages: [{ role: 'user', content: 'Write a file to /tmp/example.py.' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'write',
+            description: 'Write a file.',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string' },
+                content: { type: 'string' },
+              },
+              required: ['path', 'content'],
+            },
+          },
+        },
+      ],
+    }),
+  });
+
+  const generateMessage = await onceMessage(socket, (payload) => payload.type === 'generate');
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: generateMessage.requestId,
+      text: '"{\\"type\\":\\"write\\",\\"arguments\\":{\\"path\\":\\"/tmp/example.py\\",\\"content\\":\\"print(1)\\"}}"',
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 6,
+      },
+    }),
+  );
+
+  const response = await requestPromise;
+  const body = await response.json();
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(body.choices[0].message.tool_calls[0].function.name, 'write');
+
+  const statusResponse = await fetch(`http://127.0.0.1:${port}/api/status`);
+  const statusBody = await statusResponse.json();
+  const recoveryLog = statusBody.logs.find(
+    (entry) => entry.message === `Recovered tool response locally for ${generateMessage.requestId}`,
+  );
+  assert.ok(recoveryLog);
+  assert.equal(recoveryLog.details.localRepairCount, 1);
+
+  const closed = onceClose(socket);
+  socket.close();
+  await closed;
+  await bridgeServer.close();
+});
+
+test('recovers write tool calls with unescaped inner quotes', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  await onceOpen(socket);
+  await readyBridge(socket);
+
+  const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'chrome-prompt-api',
+      messages: [{ role: 'user', content: 'Write hello.py with a hello world print statement.' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'write',
+            description: 'Write a file.',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string' },
+                content: { type: 'string' },
+              },
+              required: ['path', 'content'],
+            },
+          },
+        },
+      ],
+    }),
+  });
+
+  const generateMessage = await onceMessage(socket, (payload) => payload.type === 'generate');
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: generateMessage.requestId,
+      text: '{"type":"tool_calls","tool_calls":[{"name":"write","arguments":{"path":"hello.py","content":"print("Hello, world!")"}}]}}',
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 8,
+      },
+    }),
+  );
+
+  const response = await requestPromise;
+  const body = await response.json();
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(body.choices[0].message.tool_calls[0].function.name, 'write');
+  assert.equal(
+    body.choices[0].message.tool_calls[0].function.arguments,
+    '{"path":"hello.py","content":"print(\\"Hello, world!\\")"}',
+  );
+
+  const closed = onceClose(socket);
+  socket.close();
+  await closed;
+  await bridgeServer.close();
+});
+
+test('retries malformed tool-call-shaped output up to a second repair generation', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  await onceOpen(socket);
+  await readyBridge(socket);
+
+  const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'chrome-prompt-api',
+      messages: [{ role: 'user', content: 'Write a file to /tmp/example.py.' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'write',
+            description: 'Write a file.',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string' },
+                content: { type: 'string' },
+              },
+              required: ['path', 'content'],
+            },
+          },
+        },
+      ],
+    }),
+  });
+
+  const firstGenerate = await onceMessage(socket, (payload) => payload.type === 'generate');
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: firstGenerate.requestId,
+      text: '{"type":"tool_calls","tool_calls":[{"arguments":{"path":"/tmp/example.py","content":"print(1)"}}]}',
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 6,
+      },
+    }),
+  );
+
+  const secondGenerate = await onceMessage(socket, (payload) => payload.type === 'generate');
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: secondGenerate.requestId,
+      text: '{"type":"tool_calls","tool_calls":[{"arguments":{"path":"/tmp/example.py","content":"print(1)"}}]}',
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 6,
+      },
+    }),
+  );
+
+  const thirdGenerate = await onceMessage(socket, (payload) => payload.type === 'generate');
+  assert.match(thirdGenerate.payload.promptText, /could not be parsed or matched/i);
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: thirdGenerate.requestId,
+      text: '{"type":"write","arguments":{"path":"/tmp/example.py","content":"print(1)"}}',
+      usage: {
+        prompt_tokens: 14,
+        completion_tokens: 4,
+      },
+    }),
+  );
+
+  const response = await requestPromise;
+  const body = await response.json();
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(body.choices[0].message.tool_calls[0].function.name, 'write');
+
+  const statusResponse = await fetch(`http://127.0.0.1:${port}/api/status`);
+  const statusBody = await statusResponse.json();
+  const retryLogs = statusBody.logs.filter((entry) => entry.message === `Retrying malformed tool response for ${firstGenerate.requestId}`);
+  assert.equal(retryLogs.length, 1);
+  assert.equal(retryLogs[0].details.normalizationErrors[0].reason, 'missing_tool_name');
+  const secondRetryLog = statusBody.logs.find((entry) => entry.message === `Retrying malformed tool response for ${secondGenerate.requestId}`);
+  assert.ok(secondRetryLog);
+  assert.equal(secondRetryLog.details.attempt, 2);
 
   const closed = onceClose(socket);
   socket.close();

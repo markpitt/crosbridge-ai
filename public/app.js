@@ -1,3 +1,5 @@
+import { buildPrompt, findLongestExactPrefixMatch, flattenContent, buildPromptSignature } from '/lib/prompt-cache.js';
+import { BASE_SYSTEM_PROMPT } from '/lib/prompt-constants.js';
 import { marked } from '/vendor/marked/marked.esm.js';
 
 const connectionPill = document.querySelector('#connection-pill');
@@ -24,9 +26,15 @@ const state = {
   chatSession: null,
   chatBusy: false,
   serverLogs: [],
+  sessionCache: [],
+  pendingPromptSessions: new Map(),
+  basePromptSession: null,
+  basePromptSessionPromise: null,
 };
 
 const COMPLETION_RESERVE_TOKENS = 4096;
+const SESSION_CACHE_LIMIT = 12;
+const SESSION_CACHE_MIN_PREFIX_MESSAGES = 2;
 
 marked.setOptions({
   gfm: true,
@@ -40,37 +48,6 @@ function countWords(text = '') {
 
 function estimateTokens(text = '') {
   return Math.ceil(text.length / 4);
-}
-
-function flattenContent(content) {
-  if (typeof content === 'string') {
-    return content;
-  }
-
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === 'string') {
-          return part;
-        }
-
-        if (part?.type === 'text' && typeof part.text === 'string') {
-          return part.text;
-        }
-
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n');
-  }
-
-  return '';
-}
-
-function buildPrompt(messages) {
-  return messages
-    .map((message) => `${String(message?.role || 'user').toUpperCase()}: ${flattenContent(message?.content)}`)
-    .join('\n\n');
 }
 
 function escapeHtml(text) {
@@ -292,7 +269,8 @@ function buildContextOverflowMessage(details) {
   return parts.join(' ');
 }
 
-async function preparePromptForSession(session, messages) {
+async function preparePromptForSession(session, messages, options = {}) {
+  const allowSessionOverflow = options.allowSessionOverflow === true;
   let workingMessages = [...messages];
   let promptText = buildPrompt(workingMessages);
   let measuredTokens =
@@ -301,6 +279,16 @@ async function preparePromptForSession(session, messages) {
   const reserveTokens = contextWindow ? Math.min(COMPLETION_RESERVE_TOKENS, Math.max(1024, Math.floor(contextWindow * 0.1))) : COMPLETION_RESERVE_TOKENS;
   const limit = contextWindow ? Math.max(1, contextWindow - reserveTokens) : null;
   let trimmedMessages = 0;
+
+  if (allowSessionOverflow) {
+    return {
+      promptText,
+      promptTokens: measuredTokens,
+      contextWindow,
+      trimmedMessages,
+      workingMessages,
+    };
+  }
 
   while (limit && measuredTokens > limit) {
     const trimIndex = workingMessages.findIndex((message, index) => index < workingMessages.length - 1 && message?.role !== 'system');
@@ -338,6 +326,161 @@ async function preparePromptForSession(session, messages) {
     promptTokens: measuredTokens,
     contextWindow,
     trimmedMessages,
+    workingMessages,
+  };
+}
+
+async function destroySessionSafely(session) {
+  if (typeof session?.destroy === 'function') {
+    await session.destroy();
+  }
+}
+
+async function getBasePromptSession() {
+  if (state.basePromptSession) {
+    return state.basePromptSession;
+  }
+
+  if (state.basePromptSessionPromise) {
+    return state.basePromptSessionPromise;
+  }
+
+  state.basePromptSessionPromise = (async () => {
+    const session = await window.LanguageModel.create({
+      initialPrompts: [
+        {
+          role: 'system',
+          content: BASE_SYSTEM_PROMPT,
+        },
+      ],
+    });
+    state.basePromptSession = session;
+    appendLog('Prepared base Prompt API session');
+    return session;
+  })();
+
+  try {
+    return await state.basePromptSessionPromise;
+  } finally {
+    state.basePromptSessionPromise = null;
+  }
+}
+
+function touchCacheEntry(entry) {
+  entry.lastUsedAt = Date.now();
+}
+
+async function pruneSessionCache() {
+  while (state.sessionCache.length > SESSION_CACHE_LIMIT) {
+    state.sessionCache.sort((left, right) => left.lastUsedAt - right.lastUsedAt);
+    const evicted = state.sessionCache.shift();
+    await destroySessionSafely(evicted?.session);
+  }
+}
+
+async function storePromptSession(session, transcriptMessages) {
+  const signature = buildPromptSignature(transcriptMessages);
+  if (!signature.length) {
+    return false;
+  }
+
+  const existingIndex = state.sessionCache.findIndex(
+    (entry) =>
+      entry.signature.length === signature.length &&
+      entry.signature.every((value, index) => value === signature[index]),
+  );
+  if (existingIndex !== -1) {
+    const [existingEntry] = state.sessionCache.splice(existingIndex, 1);
+    await destroySessionSafely(existingEntry?.session);
+  }
+
+  state.sessionCache.push({
+    signature,
+    session,
+    lastUsedAt: Date.now(),
+  });
+  await pruneSessionCache();
+  return true;
+}
+
+function retainPendingPromptSession(requestId, session) {
+  const existingEntry = state.pendingPromptSessions.get(requestId);
+  if (existingEntry) {
+    window.clearTimeout(existingEntry.timeoutId);
+  }
+
+  const timeoutId = window.setTimeout(async () => {
+    const entry = state.pendingPromptSessions.get(requestId);
+    if (!entry) {
+      return;
+    }
+
+    state.pendingPromptSessions.delete(requestId);
+    await destroySessionSafely(entry.session);
+    appendLog(`Prompt cache store timed out for ${requestId}`);
+  }, 30000);
+
+  state.pendingPromptSessions.set(requestId, {
+    session,
+    timeoutId,
+  });
+}
+
+function releasePendingPromptSession(requestId) {
+  const entry = state.pendingPromptSessions.get(requestId);
+  if (!entry) {
+    return null;
+  }
+
+  state.pendingPromptSessions.delete(requestId);
+  window.clearTimeout(entry.timeoutId);
+  return entry.session;
+}
+
+async function reservePromptSession(payload, requestId) {
+  const requestMessages = Array.isArray(payload?.messages) ? payload.messages : [];
+  const cacheEnabled = payload?.cache?.enabled === true;
+  const minPrefixMessages = Number.isInteger(payload?.cache?.minPrefixMessages)
+    ? payload.cache.minPrefixMessages
+    : SESSION_CACHE_MIN_PREFIX_MESSAGES;
+  const cacheMatch = cacheEnabled
+    ? findLongestExactPrefixMatch(state.sessionCache, requestMessages, minPrefixMessages)
+    : { entry: null, prefixMessages: 0, suffixMessages: requestMessages.length };
+
+  if (cacheMatch.entry) {
+    touchCacheEntry(cacheMatch.entry);
+
+    try {
+      const session = await cacheMatch.entry.session.clone();
+      appendLog(`Prompt cache hit for ${requestId}: reused ${cacheMatch.prefixMessages} messages`);
+      return {
+        session,
+        requestMessages,
+        promptMessages: requestMessages.slice(cacheMatch.prefixMessages),
+        cache: {
+          enabled: true,
+          hit: true,
+          prefixMessages: cacheMatch.prefixMessages,
+          suffixMessages: cacheMatch.suffixMessages,
+          entries: state.sessionCache.length,
+        },
+      };
+    } catch (error) {
+      appendLog(`Prompt cache clone failed for ${requestId}: ${formatError(error)}`);
+    }
+  }
+
+  return {
+    session: await (await getBasePromptSession()).clone(),
+    requestMessages,
+    promptMessages: requestMessages,
+    cache: {
+      enabled: cacheEnabled,
+      hit: false,
+      prefixMessages: 0,
+      suffixMessages: requestMessages.length,
+      entries: state.sessionCache.length,
+    },
   };
 }
 
@@ -347,6 +490,7 @@ async function runRequest(socket, message) {
   appendLog(`Starting request ${requestId}`);
 
   let session;
+  let keepSession = false;
   let outputText = '';
   let firstChunkAt = null;
   let streamFallbackUsed = false;
@@ -357,8 +501,11 @@ async function runRequest(socket, message) {
       throw new Error('window.LanguageModel.create() is not available in this browser.');
     }
 
-    session = await window.LanguageModel.create();
-    const preparedPrompt = await preparePromptForSession(session, payload.messages);
+    const sessionReservation = await reservePromptSession(payload, requestId);
+    session = sessionReservation.session;
+    const preparedPrompt = await preparePromptForSession(session, sessionReservation.promptMessages, {
+      allowSessionOverflow: sessionReservation.cache.hit,
+    });
     const promptText = preparedPrompt.promptText;
     const promptWords = countWords(promptText);
 
@@ -370,6 +517,11 @@ async function runRequest(socket, message) {
         prompt_tokens: preparedPrompt.promptTokens,
         context_window: preparedPrompt.contextWindow,
         trimmed_messages: preparedPrompt.trimmedMessages,
+        cache_hit: sessionReservation.cache.hit,
+        cache_prefix_messages: sessionReservation.cache.prefixMessages,
+        cache_suffix_messages: sessionReservation.cache.suffixMessages,
+        cache_entries: sessionReservation.cache.entries,
+        cache_awaiting_store: payload?.cache?.enabled === true && payload?.cache?.awaitServerStore === true,
       },
     });
 
@@ -405,6 +557,17 @@ async function runRequest(socket, message) {
 
     const completionWords = countWords(outputText);
     const completionTokens = estimateTokens(outputText);
+    if (payload?.cache?.enabled === true) {
+      if (payload?.cache?.awaitServerStore === true) {
+        retainPendingPromptSession(requestId, session);
+        keepSession = true;
+      } else {
+        keepSession = await storePromptSession(session, [
+          ...sessionReservation.requestMessages,
+          { role: 'assistant', content: outputText },
+        ]);
+      }
+    }
 
     sendJson(socket, {
       type: 'job-complete',
@@ -418,6 +581,12 @@ async function runRequest(socket, message) {
         context_window: preparedPrompt.contextWindow,
         trimmed_messages: preparedPrompt.trimmedMessages,
         stream_fallback_used: streamFallbackUsed,
+        cache_hit: sessionReservation.cache.hit,
+        cache_prefix_messages: sessionReservation.cache.prefixMessages,
+        cache_suffix_messages: sessionReservation.cache.suffixMessages,
+        cache_entries: state.sessionCache.length,
+        cache_stored: keepSession && payload?.cache?.awaitServerStore !== true,
+        cache_awaiting_store: payload?.cache?.enabled === true && payload?.cache?.awaitServerStore === true,
       },
       timings: {
         total_ms: Math.round(performance.now() - startedAt),
@@ -449,8 +618,8 @@ async function runRequest(socket, message) {
     });
     appendLog(`Request ${requestId} failed: ${messageText}`);
   } finally {
-    if (typeof session?.destroy === 'function') {
-      await session.destroy();
+    if (!keepSession) {
+      await destroySessionSafely(session);
     }
   }
 }
@@ -479,6 +648,34 @@ function connect() {
 
     if (payload.type === 'server-log') {
       renderLocalLogs([...state.serverLogs.slice(-24), payload.entry]);
+      return;
+    }
+
+    if (payload.type === 'cache-store') {
+      const session = releasePendingPromptSession(payload.requestId);
+      if (!session) {
+        return;
+      }
+
+      const stored = await storePromptSession(session, payload.messages);
+      if (!stored) {
+        await destroySessionSafely(session);
+        appendLog(`Prompt cache store skipped for ${payload.requestId}`);
+        return;
+      }
+
+      appendLog(`Stored prompt cache for ${payload.requestId}`);
+      return;
+    }
+
+    if (payload.type === 'cache-discard') {
+      const session = releasePendingPromptSession(payload.requestId);
+      if (!session) {
+        return;
+      }
+
+      await destroySessionSafely(session);
+      appendLog(`Discarded prompt cache for ${payload.requestId}`);
       return;
     }
 

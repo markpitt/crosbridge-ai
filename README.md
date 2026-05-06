@@ -19,9 +19,9 @@ Chrome can access the built-in Prompt API and the device's on-device AI accelera
 2. It opens a page in ChromeOS.
 3. That page connects back to the server over WebSocket.
 4. OpenAI-style requests sent to the local server are forwarded to Chrome.
-5. Chrome runs `LanguageModel.create()` and streams the result back.
+5. Chrome runs the Prompt API session and streams the result back.
 
-The OpenAI endpoint is intentionally **stateless**: each request creates a fresh browser-side model session.
+The OpenAI endpoint is still **stateless** from the client's perspective, but the hosted page now keeps a shared Prompt API **base system session** plus a small in-memory **exact-prefix session cache**, both built around `clone()` reuse for matching chat and tool transcripts.
 
 ## 📋 Requirements
 
@@ -163,10 +163,32 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 - OpenAI-compatible `GET /v1/models`
 - SSE streaming and non-streaming responses
 - OpenAI-style `tools` / `tool_calls`
-- tolerant parsing for a few non-standard tool-call output shapes seen in practice
+- bounded local/model repair for malformed tool-call JSON
+- exact-prefix Prompt API session caching via `clone()`
 - hosted browser dashboard with logs and stats
 - simple server-backed multi-turn chat UI
 - terminal logging with request metrics
+
+## 🔧 Tool-call repair
+
+Tool-mode responses from on-device models are often close to valid JSON without being perfectly parseable. The bridge now uses a bounded repair pipeline before giving up:
+
+1. local repair attempts such as code-fence stripping, JSON slice extraction, inner-quote escaping, and `jsonrepair`
+2. tool-argument validation against the provided tool schema with `ajv`
+3. bounded regeneration retries when the response is still malformed
+
+This makes common real-world failures recoverable, including extra braces, fenced JSON, stringified tool payloads, and broken quoting inside arguments like file contents.
+
+## ⚡ Prompt caching
+
+The hosted page keeps:
+
+- one shared Prompt API **base system session**
+- a small in-memory **LRU cache** of exact message-prefix sessions
+
+New requests first try to reuse the longest exact cached prefix and only prompt the remaining suffix. This works for both normal chat and tool transcripts, so long multi-turn tool sessions get dramatically smaller incremental prompts over time.
+
+When a request goes into duplicate-tool retry or malformed-tool retry flows, the pending cache entry for that request is discarded so retry-only prompt state does not pollute future cache matches.
 
 ## 🚧 Future improvement
 
@@ -189,10 +211,11 @@ Unsupported OpenAI fields are currently ignored.
 
 ## 🛠️ Operational notes
 
-- Each OpenAI request creates a fresh browser-side `LanguageModel` session.
+- Requests clone from a shared base Prompt API session and may also clone from a cached exact-prefix session when available.
 - The actual context window comes from the browser model, not the OpenAI client.
 - On some ChromeOS Prompt API models, the real window may be much smaller than clients expect.
 - Usage values are estimated from character counts when the browser does not provide more detailed information.
+- Request logs include cache metrics such as `cacheHit`, prefix/suffix message counts, and whether a cache entry was stored or discarded.
 - The default browser-generation timeout is 5 minutes.
 - If the browser page disconnects, in-flight requests fail immediately.
 - Hosted chat history lives only in memory for the lifetime of the process.

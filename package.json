@@ -12,7 +12,9 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
+    "ajv": "^8.20.0",
     "express": "^5.2.1",
+    "jsonrepair": "^3.14.0",
     "marked": "^18.0.3",
     "ws": "^8.20.0"
   }

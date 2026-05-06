@@ -4,13 +4,21 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import Ajv from 'ajv';
 import express from 'express';
+import { jsonrepair } from 'jsonrepair';
 import { WebSocketServer, WebSocket } from 'ws';
+
+import { buildPrompt, flattenContent } from '../public/lib/prompt-cache.js';
+import { BASE_SYSTEM_PROMPT } from '../public/lib/prompt-constants.js';
 
 const DEFAULT_PORT = Number(process.env.PORT || 8787);
 const DEFAULT_MODEL = 'chrome-prompt-api';
 const DEFAULT_REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 300000);
 const MAX_LOG_ENTRIES = 200;
+const MAX_LOCAL_TOOL_REPAIRS = 3;
+const MAX_TOOL_REPAIR_GENERATIONS = 3;
+const ajv = new Ajv({ allErrors: true, strict: false, allowUnionTypes: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,55 +45,6 @@ function extractDelta(accumulatedText = '', nextText = '') {
   }
 
   return nextText;
-}
-
-function flattenContent(content) {
-  if (typeof content === 'string') {
-    return content;
-  }
-
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === 'string') {
-          return part;
-        }
-
-        if (part?.type === 'text' && typeof part.text === 'string') {
-          return part.text;
-        }
-
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n');
-  }
-
-  return '';
-}
-
-function createPromptTranscript(messages) {
-  return messages
-    .map((message) => {
-      const role = typeof message?.role === 'string' ? message.role : 'user';
-      if (role === 'assistant' && Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
-        return `ASSISTANT TOOL_CALLS: ${JSON.stringify(message.tool_calls)}`;
-      }
-
-      if (role === 'tool') {
-        const toolName =
-          typeof message?.name === 'string'
-            ? message.name
-            : typeof message?.tool_call_id === 'string'
-              ? message.tool_call_id
-              : 'tool';
-        return `TOOL ${toolName}: ${flattenContent(message?.content)}`;
-      }
-
-      const content = flattenContent(message?.content);
-      return `${role.toUpperCase()}: ${content}`;
-    })
-    .join('\n\n');
 }
 
 function openAiError(message, type = 'invalid_request_error', code) {
@@ -207,12 +166,178 @@ function buildToolDefinitionMap(tools) {
   return new Map(
     normalizeTools(tools).map((tool) => [
       tool.function.name,
-      {
-        name: tool.function.name,
-        parameters: tool.function.parameters ?? {},
-      },
+      (() => {
+        const parameters = tool.function.parameters ?? {};
+        let validator = null;
+        let validatorError = null;
+
+        if (parameters && typeof parameters === 'object') {
+          try {
+            validator = ajv.compile(parameters);
+          } catch (error) {
+            validatorError = error instanceof Error ? error.message : String(error);
+          }
+        }
+
+        return {
+          name: tool.function.name,
+          parameters,
+          validator,
+          validatorError,
+        };
+      })(),
     ]),
   );
+}
+
+function summarizeValidationErrors(errors = []) {
+  return errors.map((error) => ({
+    instancePath: error.instancePath || '',
+    schemaPath: error.schemaPath || '',
+    keyword: error.keyword || '',
+    message: error.message || '',
+    params: error.params || {},
+  }));
+}
+
+function tryJsonRepair(text) {
+  if (typeof text !== 'string' || !text.trim()) {
+    return null;
+  }
+
+  try {
+    return jsonrepair(text).trim();
+  } catch {
+    return null;
+  }
+}
+
+function escapeInnerQuotesInJsonLikeText(text) {
+  if (typeof text !== 'string' || !text.includes('"')) {
+    return null;
+  }
+
+  const chars = [...text];
+  const result = [];
+  const stack = [];
+  let inString = false;
+  let escaping = false;
+  let stringRole = 'value';
+  let changed = false;
+
+  const nextNonWhitespace = (index) => {
+    for (let cursor = index + 1; cursor < chars.length; cursor += 1) {
+      if (!/\s/.test(chars[cursor])) {
+        return chars[cursor];
+      }
+    }
+
+    return null;
+  };
+
+  const markValueConsumed = () => {
+    const top = stack[stack.length - 1];
+    if (!top) {
+      return;
+    }
+
+    top.expecting = 'comma_or_end';
+  };
+
+  for (let index = 0; index < chars.length; index += 1) {
+    const char = chars[index];
+
+    if (inString) {
+      if (escaping) {
+        result.push(char);
+        escaping = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        result.push(char);
+        escaping = true;
+        continue;
+      }
+
+      if (char === '"') {
+        const next = nextNonWhitespace(index);
+        const shouldClose =
+          stringRole === 'key'
+            ? next === ':'
+            : next === null || next === ',' || next === '}' || next === ']';
+
+        if (shouldClose) {
+          inString = false;
+          result.push(char);
+
+          const top = stack[stack.length - 1];
+          if (top?.type === 'object') {
+            top.expecting = stringRole === 'key' ? 'colon' : 'comma_or_end';
+          } else if (top?.type === 'array' && stringRole === 'value') {
+            top.expecting = 'comma_or_end';
+          }
+          continue;
+        }
+
+        result.push('\\"');
+        changed = true;
+        continue;
+      }
+
+      result.push(char);
+      continue;
+    }
+
+    if (char === '"') {
+      const top = stack[stack.length - 1];
+      stringRole = top?.type === 'object' && top.expecting === 'key' ? 'key' : 'value';
+      inString = true;
+      result.push(char);
+      continue;
+    }
+
+    result.push(char);
+
+    if (char === '{') {
+      stack.push({ type: 'object', expecting: 'key' });
+      continue;
+    }
+
+    if (char === '[') {
+      stack.push({ type: 'array', expecting: 'value' });
+      continue;
+    }
+
+    if (char === '}' || char === ']') {
+      stack.pop();
+      markValueConsumed();
+      continue;
+    }
+
+    const top = stack[stack.length - 1];
+    if (!top) {
+      continue;
+    }
+
+    if (char === ':') {
+      if (top.type === 'object') {
+        top.expecting = 'value';
+      }
+      continue;
+    }
+
+    if (char === ',') {
+      top.expecting = top.type === 'object' ? 'key' : 'value';
+      continue;
+    }
+
+    if (!/\s/.test(char) && top.expecting === 'value' && char !== '"' && char !== '{' && char !== '[') {
+      markValueConsumed();
+    }
+  }
+
+  return changed ? result.join('') : null;
 }
 
 function describeToolChoice(toolChoice) {
@@ -286,13 +411,7 @@ function buildToolInstruction(tools, toolChoice, messages = []) {
   );
 
   return [
-    'You are responding for an OpenAI-compatible chat completions API.',
-    'When you need to call a tool, respond with raw JSON only and no markdown fences.',
-    'If you want to call tools, output exactly:',
-    '{"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{}}]}',
-    'You may also use the shorthand {"type":"tool_name","arguments":{}} for a single tool call.',
-    'If you want to answer normally, reply with plain text, not JSON.',
-    'If you still choose to wrap a final answer, use {"type":"final","content":"your answer"}.',
+    'The base system prompt already defines the OpenAI-compatible response format and the default tool-call JSON shapes.',
     'If the conversation already includes tool results that answer the user, return a final answer instead of repeating the same tool call.',
     describeToolChoice(toolChoice),
     ...buildToolPreferenceHints(messages, tools),
@@ -327,6 +446,24 @@ function parseJsonValue(text) {
   try {
     return JSON.parse(candidate);
   } catch {
+    const escaped = escapeInnerQuotesInJsonLikeText(candidate);
+    if (escaped && escaped !== candidate) {
+      try {
+        return JSON.parse(escaped);
+      } catch {
+        // Fall through to jsonrepair.
+      }
+    }
+
+    const repaired = tryJsonRepair(candidate);
+    if (repaired && repaired !== candidate) {
+      try {
+        return JSON.parse(repaired);
+      } catch {
+        // Fall through to slice extraction.
+      }
+    }
+
     const starts = ['{', '[']
       .map((symbol) => candidate.indexOf(symbol))
       .filter((index) => index !== -1)
@@ -343,9 +480,98 @@ function parseJsonValue(text) {
     try {
       return JSON.parse(candidate.slice(firstIndex, lastIndex + 1));
     } catch {
+      const escapedSlice = escapeInnerQuotesInJsonLikeText(candidate.slice(firstIndex, lastIndex + 1));
+      if (escapedSlice) {
+        try {
+          return JSON.parse(escapedSlice);
+        } catch {
+          // Fall through to jsonrepair.
+        }
+      }
+
+      const repairedSlice = tryJsonRepair(candidate.slice(firstIndex, lastIndex + 1));
+      if (repairedSlice) {
+        try {
+          return JSON.parse(repairedSlice);
+        } catch {
+          return null;
+        }
+      }
+
       return null;
     }
   }
+}
+
+function extractLikelyJsonSlice(text) {
+  const candidate = stripCodeFence(text);
+  const starts = ['{', '[']
+    .map((symbol) => candidate.indexOf(symbol))
+    .filter((index) => index !== -1)
+    .sort((left, right) => left - right);
+  const firstIndex = starts[0];
+  const lastBrace = candidate.lastIndexOf('}');
+  const lastBracket = candidate.lastIndexOf(']');
+  const lastIndex = Math.max(lastBrace, lastBracket);
+
+  if (firstIndex === undefined || lastIndex === -1 || lastIndex <= firstIndex) {
+    return null;
+  }
+
+  return candidate.slice(firstIndex, lastIndex + 1).trim();
+}
+
+function unescapeLikelyJsonString(text) {
+  const candidate = stripCodeFence(text).trim();
+  if (!candidate || (!candidate.includes('\\"') && !candidate.includes('\\n') && !candidate.includes('\\\\'))) {
+    return null;
+  }
+
+  const unescaped = candidate
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, '\n')
+    .replace(/\\\\/g, '\\')
+    .trim();
+
+  if (!unescaped || unescaped === candidate) {
+    return null;
+  }
+
+  return unescaped;
+}
+
+function collectToolRepairCandidates(text) {
+  const candidates = [];
+  const seen = new Set([text]);
+  const addCandidate = (label, candidate) => {
+    if (typeof candidate !== 'string') {
+      return;
+    }
+
+    const trimmed = candidate.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      return;
+    }
+
+    seen.add(trimmed);
+    candidates.push({ label, text: trimmed });
+  };
+
+  const stripped = stripCodeFence(text).trim();
+  addCandidate('strip-code-fence', stripped);
+
+  const parsed = parseJsonValue(text);
+  if (typeof parsed === 'string') {
+    addCandidate('parse-stringified-json', parsed);
+    addCandidate('extract-json-from-stringified', extractLikelyJsonSlice(parsed));
+  }
+
+  addCandidate('escape-inner-quotes', escapeInnerQuotesInJsonLikeText(stripped));
+  addCandidate('jsonrepair', tryJsonRepair(stripped));
+  addCandidate('extract-json-slice', extractLikelyJsonSlice(text));
+  addCandidate('unescape-json-string', unescapeLikelyJsonString(text));
+
+  return candidates.slice(0, MAX_LOCAL_TOOL_REPAIRS);
 }
 
 function normalizeToolArguments(rawArguments) {
@@ -406,6 +632,21 @@ function coerceToolArguments(rawArguments, toolDefinition) {
     return JSON.stringify(parsed);
   }
 
+  const repaired = tryJsonRepair(trimmed);
+  if (repaired) {
+    const repairedParsed = parseJsonValue(repaired);
+    if (repairedParsed !== null) {
+      if (typeof repairedParsed === 'string') {
+        const singleArgName = inferSingleStringArgumentName(toolDefinition?.parameters);
+        if (singleArgName) {
+          return JSON.stringify({ [singleArgName]: repairedParsed });
+        }
+      }
+
+      return JSON.stringify(repairedParsed);
+    }
+  }
+
   const singleArgName = inferSingleStringArgumentName(toolDefinition?.parameters);
   if (singleArgName) {
     const propertyPrefixPattern = new RegExp(`^["']?${singleArgName}["']?\\s*:\\s*`, 'i');
@@ -448,28 +689,91 @@ function normalizeToolCall(toolCall, allowedNames, toolDefinitions, index) {
     toolCall?.function?.name ??
     (typeof toolCall?.type === 'string' && toolCall.type !== 'function' ? toolCall.type : null);
   if (typeof rawName !== 'string') {
-    return null;
+    return {
+      value: null,
+      error: {
+        reason: 'missing_tool_name',
+        rawToolName: null,
+      },
+    };
   }
 
   const name = resolveAllowedToolName(rawName, allowedNames);
   if (!name) {
-    return null;
+    return {
+      value: null,
+      error: {
+        reason: 'unknown_tool_name',
+        rawToolName: rawName,
+      },
+    };
   }
 
   const toolDefinition = toolDefinitions.get(name);
+  if (toolDefinition?.validatorError) {
+    return {
+      value: null,
+      error: {
+        reason: 'invalid_tool_schema',
+        rawToolName: rawName,
+        normalizedToolName: name,
+        validatorError: toolDefinition.validatorError,
+      },
+    };
+  }
+
+  const argumentsText = coerceToolArguments(toolCall?.arguments ?? toolCall?.function?.arguments ?? {}, toolDefinition);
+  const parsedArguments = parseJsonValue(argumentsText);
+  if (parsedArguments === null || typeof parsedArguments !== 'object' || Array.isArray(parsedArguments)) {
+    return {
+      value: null,
+      error: {
+        reason: 'invalid_tool_arguments_json',
+        rawToolName: rawName,
+        normalizedToolName: name,
+        argumentsPreview: String(argumentsText).slice(0, 200),
+      },
+    };
+  }
+
+  if (typeof toolDefinition?.validator === 'function' && !toolDefinition.validator(parsedArguments)) {
+    return {
+      value: null,
+      error: {
+        reason: 'tool_arguments_failed_schema_validation',
+        rawToolName: rawName,
+        normalizedToolName: name,
+        argumentsPreview: JSON.stringify(parsedArguments).slice(0, 200),
+        validationErrors: summarizeValidationErrors(toolDefinition.validator.errors),
+      },
+    };
+  }
 
   return {
-    id: typeof toolCall?.id === 'string' ? toolCall.id : `call_${randomUUID().replaceAll('-', '').slice(0, 24)}`,
-    type: 'function',
-    function: {
-      name,
-      arguments: coerceToolArguments(toolCall?.arguments ?? toolCall?.function?.arguments ?? {}, toolDefinition),
+    value: {
+      id: typeof toolCall?.id === 'string' ? toolCall.id : `call_${randomUUID().replaceAll('-', '').slice(0, 24)}`,
+      type: 'function',
+      function: {
+        name,
+        arguments: JSON.stringify(parsedArguments),
+      },
+      index,
     },
-    index,
+    error: null,
   };
 }
 
 function looksLikeToolCallResponse(text, parsed) {
+  if (typeof parsed === 'string') {
+    const nestedParsed = parseJsonValue(parsed);
+    const nestedCandidate = stripCodeFence(parsed);
+    if (nestedParsed !== null && nestedParsed !== parsed) {
+      return looksLikeToolCallResponse(parsed, nestedParsed);
+    }
+
+    return /"tool_calls"\s*:|^\s*\[\s*\{[\s\S]*"arguments"\s*:|^\s*\{\s*"type"\s*:\s*"(?!final")/i.test(nestedCandidate);
+  }
+
   if (Array.isArray(parsed) || Array.isArray(parsed?.tool_calls) || Array.isArray(parsed?.calls) || parsed?.type === 'tool_calls') {
     return true;
   }
@@ -478,17 +782,18 @@ function looksLikeToolCallResponse(text, parsed) {
   return /"tool_calls"\s*:|```tool_calls```|^\s*\[\s*\{[\s\S]*"arguments"\s*:|^\s*\{\s*"type"\s*:\s*"(?!final")/i.test(candidate);
 }
 
-function buildMalformedToolCallDetails(text, allowedNames, rawToolCalls) {
+function buildMalformedToolCallDetails(text, allowedNames, rawToolCalls, normalizationErrors = []) {
   return {
     allowedToolNames: Array.from(allowedNames),
     rawToolNames: Array.isArray(rawToolCalls)
       ? rawToolCalls.map((toolCall) => toolCall?.name ?? toolCall?.function?.name ?? toolCall?.type ?? null)
       : [],
     responsePreview: stripCodeFence(text).slice(0, 400),
+    normalizationErrors,
   };
 }
 
-function normalizeToolModeResponse(text, tools) {
+function normalizeSingleToolModeResponse(text, tools) {
   const parsed = parseJsonValue(text);
   const allowedNames = new Set(tools.map((tool) => tool.function.name));
   const toolDefinitions = buildToolDefinitionMap(tools);
@@ -511,9 +816,11 @@ function normalizeToolModeResponse(text, tools) {
   }
 
   if (rawToolCalls) {
-    const toolCalls = rawToolCalls
-      .map((toolCall, index) => normalizeToolCall(toolCall, allowedNames, toolDefinitions, index))
-      .filter(Boolean);
+    const normalizedResults = rawToolCalls.map((toolCall, index) =>
+      normalizeToolCall(toolCall, allowedNames, toolDefinitions, index),
+    );
+    const toolCalls = normalizedResults.map((result) => result.value).filter(Boolean);
+    const normalizationErrors = normalizedResults.map((result) => result.error).filter(Boolean);
 
     if (toolCalls.length > 0) {
       return {
@@ -526,7 +833,7 @@ function normalizeToolModeResponse(text, tools) {
     return {
       kind: 'final',
       content: text,
-      malformedToolCall: buildMalformedToolCallDetails(text, allowedNames, rawToolCalls),
+      malformedToolCall: buildMalformedToolCallDetails(text, allowedNames, rawToolCalls, normalizationErrors),
     };
   }
 
@@ -555,6 +862,52 @@ function normalizeToolModeResponse(text, tools) {
   };
 }
 
+function normalizeToolModeResponse(text, tools) {
+  const originalResult = normalizeSingleToolModeResponse(text, tools);
+  originalResult.localRepairCount = 0;
+  originalResult.repairedBy = null;
+  originalResult.localRepairAttempts = [];
+
+  if (originalResult.kind === 'tool_calls' || !originalResult.malformedToolCall) {
+    return originalResult;
+  }
+
+  let fallbackResult = originalResult;
+  const localRepairAttempts = [];
+  for (const [index, candidate] of collectToolRepairCandidates(text).entries()) {
+    const repairedResult = normalizeSingleToolModeResponse(candidate.text, tools);
+    repairedResult.localRepairCount = index + 1;
+    repairedResult.repairedBy = candidate.label;
+    const attempt = {
+      repair: candidate.label,
+      index: index + 1,
+      outcome:
+        repairedResult.kind === 'tool_calls'
+          ? 'tool_calls'
+          : repairedResult.malformedToolCall
+            ? 'still_malformed'
+            : 'not_tool_shaped',
+      responsePreview: stripCodeFence(candidate.text).slice(0, 200),
+      rawToolNames: repairedResult.malformedToolCall?.rawToolNames ?? [],
+    };
+    localRepairAttempts.push(attempt);
+    repairedResult.localRepairAttempts = [...localRepairAttempts];
+
+    if (repairedResult.kind === 'tool_calls') {
+      return repairedResult;
+    }
+
+    fallbackResult = repairedResult.malformedToolCall
+      ? repairedResult
+      : {
+          ...fallbackResult,
+          localRepairAttempts: [...localRepairAttempts],
+        };
+  }
+
+  return fallbackResult;
+}
+
 function shouldRetryMalformedToolResponse(toolResponse, toolChoice) {
   return Boolean(
     toolResponse.kind !== 'tool_calls' &&
@@ -564,8 +917,14 @@ function shouldRetryMalformedToolResponse(toolResponse, toolChoice) {
   );
 }
 
-function buildMalformedToolRetryInstruction(tools, toolChoice, messages, malformedToolCall) {
+function buildMalformedToolRetryInstruction(tools, toolChoice, messages, toolResponse) {
   const exactToolNames = tools.map((tool) => tool.function.name).join(', ');
+  const malformedToolCall = toolResponse?.malformedToolCall ?? null;
+  const lastRepairAttempt =
+    Array.isArray(toolResponse?.localRepairAttempts) && toolResponse.localRepairAttempts.length > 0
+      ? toolResponse.localRepairAttempts[toolResponse.localRepairAttempts.length - 1]
+      : null;
+  const normalizationErrors = malformedToolCall?.normalizationErrors ?? [];
 
   return [
     'Your previous response looked like an attempted tool call, but it could not be parsed or matched to the available tools.',
@@ -573,9 +932,13 @@ function buildMalformedToolRetryInstruction(tools, toolChoice, messages, malform
     'Return raw JSON only with no markdown fences and no explanation.',
     'For one tool call, output exactly {"type":"tool_name","arguments":{}}.',
     'For multiple tool calls, output exactly {"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{}}]}.',
+    'Valid example: {"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{"key":"value"}}]}.',
+    'If a tool argument contains quotes inside a string, escape them correctly.',
     describeToolChoice(toolChoice),
     ...buildToolPreferenceHints(messages, tools),
     ...(malformedToolCall?.rawToolNames?.length ? [`Previous tool names: ${malformedToolCall.rawToolNames.join(', ')}`] : []),
+    ...(normalizationErrors.length ? [`Validation/parsing failures: ${JSON.stringify(normalizationErrors)}`] : []),
+    ...(lastRepairAttempt ? [`Bridge repair candidate: ${lastRepairAttempt.responsePreview}`] : []),
   ].join('\n');
 }
 
@@ -819,6 +1182,7 @@ export function createBridgeServer(options = {}) {
       stream: Boolean(job.metadata?.stream),
       messageCount: job.metadata?.messageCount ?? null,
       toolsProvided: job.metadata?.toolsProvided ?? 0,
+      cacheEnabled: Boolean(job.metadata?.cacheEnabled),
       toolCallsReturned: job.metadata?.toolCallsReturned ?? 0,
       duplicateRetry: Boolean(job.metadata?.duplicateRetry),
       finishReason: job.metadata?.finishReason ?? 'stop',
@@ -834,6 +1198,16 @@ export function createBridgeServer(options = {}) {
       contextWindow: Number.isFinite(job.browserUsage?.context_window) ? job.browserUsage.context_window : null,
       trimmedMessages: Number.isFinite(job.browserUsage?.trimmed_messages) ? job.browserUsage.trimmed_messages : 0,
       streamFallbackUsed: Boolean(job.browserUsage?.stream_fallback_used),
+      cacheHit: Boolean(job.browserUsage?.cache_hit),
+      cachePrefixMessages: Number.isFinite(job.browserUsage?.cache_prefix_messages)
+        ? job.browserUsage.cache_prefix_messages
+        : 0,
+      cacheSuffixMessages: Number.isFinite(job.browserUsage?.cache_suffix_messages)
+        ? job.browserUsage.cache_suffix_messages
+        : 0,
+      cacheEntries: Number.isFinite(job.browserUsage?.cache_entries) ? job.browserUsage.cache_entries : 0,
+      cacheStored: Boolean(job.browserUsage?.cache_stored),
+      cacheAwaitingStore: Boolean(job.browserUsage?.cache_awaiting_store),
       ...extra,
     };
   }
@@ -936,10 +1310,29 @@ export function createBridgeServer(options = {}) {
     }
   }
 
+  function canUsePromptCache(messages, toolsProvided = 0) {
+    return Array.isArray(messages) && messages.length > 0;
+  }
+
+  function sendCacheStore(requestId, messages) {
+    safeJsonSend(state.browser, {
+      type: 'cache-store',
+      requestId,
+      messages,
+    });
+  }
+
+  function sendCacheDiscard(requestId) {
+    safeJsonSend(state.browser, {
+      type: 'cache-discard',
+      requestId,
+    });
+  }
+
   function dispatchGeneration({ messages, model = DEFAULT_MODEL, onChunk, metadata }) {
     requireBrowserReady();
 
-    const promptText = createPromptTranscript(messages);
+    const promptText = buildPrompt(messages);
     const promptWords = countWords(promptText);
     const inputTokens = estimateTokens(promptText);
     const requestId = `chatcmpl-${randomUUID()}`;
@@ -959,6 +1352,7 @@ export function createBridgeServer(options = {}) {
       inputChars: promptText.length,
       inputWords: promptWords,
       inputTokens,
+      cacheEnabled: Boolean(metadata?.cacheEnabled),
     });
 
     let resolve;
@@ -980,6 +1374,7 @@ export function createBridgeServer(options = {}) {
         stream: Boolean(metadata?.stream),
         messageCount: metadata?.messageCount ?? messages.length,
         toolsProvided: metadata?.toolsProvided ?? 0,
+        cacheEnabled: Boolean(metadata?.cacheEnabled),
         toolCallsReturned: 0,
         duplicateRetry: false,
         finishReason: 'stop',
@@ -1005,6 +1400,11 @@ export function createBridgeServer(options = {}) {
         model,
         messages,
         promptText,
+        cache: {
+          enabled: metadata?.cacheEnabled === true,
+          minPrefixMessages: metadata?.minCachePrefixMessages ?? 2,
+          awaitServerStore: metadata?.awaitServerStore === true,
+        },
       },
     });
 
@@ -1032,15 +1432,17 @@ export function createBridgeServer(options = {}) {
     let job;
 
     try {
-      job = dispatchGeneration({
-        messages: effectiveMessages,
-        model,
-        metadata: {
-          source: 'openai-chat',
-          stream,
-          messageCount: messages.length,
-          toolsProvided: tools.length,
-        },
+        job = dispatchGeneration({
+          messages: effectiveMessages,
+          model,
+          metadata: {
+            source: 'openai-chat',
+            stream,
+            messageCount: messages.length,
+            toolsProvided: tools.length,
+            cacheEnabled: canUsePromptCache(effectiveMessages, tools.length),
+            awaitServerStore: toolMode,
+          },
         onChunk: ({ delta }) => {
           if (!stream || toolMode || res.writableEnded) {
             return;
@@ -1078,13 +1480,36 @@ export function createBridgeServer(options = {}) {
         let toolResponse = normalizeToolModeResponse(text, tools);
         let responseJob = job;
         let responseUsage = usage;
+        let malformedRepairGenerationCount = 0;
 
-        if (toolResponse.malformedToolCall) {
-          addLog('warn', `Could not normalize tool calls for ${job.id}`, toolResponse.malformedToolCall);
+        if (toolResponse.kind === 'tool_calls' && toolResponse.localRepairCount > 0) {
+          addLog('info', `Recovered tool response locally for ${job.id}`, {
+            repair: toolResponse.repairedBy,
+            localRepairCount: toolResponse.localRepairCount,
+            localRepairAttempts: toolResponse.localRepairAttempts,
+          });
         }
 
-        if (shouldRetryMalformedToolResponse(toolResponse, toolChoice)) {
-          addLog('warn', `Retrying malformed tool response for ${job.id}`, toolResponse.malformedToolCall ?? null);
+        if (toolResponse.malformedToolCall) {
+          addLog('warn', `Could not normalize tool calls for ${job.id}`, {
+            ...toolResponse.malformedToolCall,
+            localRepairAttempts: toolResponse.localRepairAttempts,
+          });
+        }
+
+        while (
+          malformedRepairGenerationCount < MAX_TOOL_REPAIR_GENERATIONS &&
+          shouldRetryMalformedToolResponse(toolResponse, toolChoice)
+        ) {
+          malformedRepairGenerationCount += 1;
+          addLog('warn', `Retrying malformed tool response for ${responseJob.id}`, {
+            ...(toolResponse.malformedToolCall ?? {}),
+            attempt: malformedRepairGenerationCount,
+            maxAttempts: MAX_TOOL_REPAIR_GENERATIONS,
+          });
+          if (responseJob.metadata.cacheEnabled) {
+            sendCacheDiscard(responseJob.id);
+          }
 
           const retryJob = dispatchGeneration({
             messages: [
@@ -1094,28 +1519,55 @@ export function createBridgeServer(options = {}) {
               },
               {
                 role: 'system',
-                content: buildMalformedToolRetryInstruction(tools, toolChoice, messages, toolResponse.malformedToolCall),
+                content: buildMalformedToolRetryInstruction(tools, toolChoice, messages, toolResponse),
               },
               ...messages,
             ],
             model,
-            metadata: {
-              source: 'openai-chat',
-              stream,
-              messageCount: messages.length + 2,
-              toolsProvided: tools.length,
-            },
+              metadata: {
+                source: 'openai-chat',
+                stream,
+                messageCount: messages.length + 2,
+                toolsProvided: tools.length,
+                cacheEnabled: false,
+                awaitServerStore: false,
+              },
           });
 
           const retryResult = await retryJob.result;
           const repairedResponse = normalizeToolModeResponse(retryResult.text, tools);
+          if (repairedResponse.kind === 'tool_calls' && repairedResponse.localRepairCount > 0) {
+            addLog('info', `Recovered tool response locally for ${retryJob.id}`, {
+              repair: repairedResponse.repairedBy,
+              localRepairCount: repairedResponse.localRepairCount,
+              afterGenerationRetry: malformedRepairGenerationCount,
+              localRepairAttempts: repairedResponse.localRepairAttempts,
+            });
+          }
+
           if (repairedResponse.malformedToolCall) {
-            addLog('warn', `Tool response remained malformed after retry for ${retryJob.id}`, repairedResponse.malformedToolCall);
+            addLog('warn', `Tool response remained malformed after retry for ${retryJob.id}`, {
+              ...repairedResponse.malformedToolCall,
+              attempt: malformedRepairGenerationCount,
+              maxAttempts: MAX_TOOL_REPAIR_GENERATIONS,
+              localRepairAttempts: repairedResponse.localRepairAttempts,
+            });
           }
 
           toolResponse = repairedResponse;
           responseJob = retryJob;
           responseUsage = retryResult.usage;
+        }
+
+        if (toolResponse.kind !== 'tool_calls' && shouldRetryMalformedToolResponse(toolResponse, toolChoice)) {
+          addLog('error', `Giving up on malformed tool response for ${responseJob.id}`, {
+            ...(toolResponse.malformedToolCall ?? {
+              responsePreview: stripCodeFence(toolResponse.content ?? '').slice(0, 400),
+            }),
+            attemptsUsed: malformedRepairGenerationCount,
+            maxAttempts: MAX_TOOL_REPAIR_GENERATIONS,
+            localRepairAttempts: toolResponse.localRepairAttempts ?? [],
+          });
         }
 
         if (toolResponse.kind === 'tool_calls') {
@@ -1127,6 +1579,9 @@ export function createBridgeServer(options = {}) {
                 arguments: toolCall.function.arguments,
               })),
             });
+            if (responseJob.metadata.cacheEnabled) {
+              sendCacheDiscard(responseJob.id);
+            }
 
             const retryJob = dispatchGeneration({
               messages: [
@@ -1142,6 +1597,8 @@ export function createBridgeServer(options = {}) {
                 stream,
                 messageCount: messages.length + 1,
                 toolsProvided: 0,
+                cacheEnabled: false,
+                awaitServerStore: false,
               },
               onChunk: ({ delta }) => {
                 if (!stream || res.writableEnded) {
@@ -1189,9 +1646,12 @@ export function createBridgeServer(options = {}) {
                   }),
                 );
                 res.write('data: [DONE]\n\n');
-              res.end();
-              return;
-            }
+                res.end();
+                if (retryJob.metadata.cacheEnabled) {
+                  sendCacheStore(retryJob.id, [...effectiveMessages, { role: 'assistant', content: finalRetryResponse.content }]);
+                }
+                return;
+              }
 
               res.json(
                 chatCompletionPayload({
@@ -1200,10 +1660,13 @@ export function createBridgeServer(options = {}) {
                 model: retryJob.model,
                 text: finalRetryResponse.content,
                 usage: retryResult.usage,
-              }),
-            );
-            return;
-          }
+                }),
+              );
+              if (retryJob.metadata.cacheEnabled) {
+                sendCacheStore(retryJob.id, [...effectiveMessages, { role: 'assistant', content: finalRetryResponse.content }]);
+              }
+              return;
+            }
 
           responseJob.metadata.toolCallsReturned = toolResponse.toolCalls.length;
           responseJob.metadata.finishReason = 'tool_calls';
@@ -1244,6 +1707,9 @@ export function createBridgeServer(options = {}) {
             );
             res.write('data: [DONE]\n\n');
             res.end();
+            if (responseJob.metadata.cacheEnabled) {
+              sendCacheStore(responseJob.id, [...effectiveMessages, { role: 'assistant', tool_calls: toolCalls }]);
+            }
             return;
           }
 
@@ -1256,6 +1722,9 @@ export function createBridgeServer(options = {}) {
               usage: responseUsage,
             }),
           );
+          if (responseJob.metadata.cacheEnabled) {
+            sendCacheStore(responseJob.id, [...effectiveMessages, { role: 'assistant', tool_calls: toolCalls }]);
+          }
           return;
         }
 
@@ -1287,6 +1756,9 @@ export function createBridgeServer(options = {}) {
           );
           res.write('data: [DONE]\n\n');
           res.end();
+          if (responseJob.metadata.cacheEnabled) {
+            sendCacheStore(responseJob.id, [...effectiveMessages, { role: 'assistant', content: toolResponse.content }]);
+          }
           return;
         }
 
@@ -1299,6 +1771,9 @@ export function createBridgeServer(options = {}) {
             usage: responseUsage,
           }),
         );
+        if (responseJob.metadata.cacheEnabled) {
+          sendCacheStore(responseJob.id, [...effectiveMessages, { role: 'assistant', content: toolResponse.content }]);
+        }
         return;
       }
 
@@ -1329,6 +1804,9 @@ export function createBridgeServer(options = {}) {
         );
         res.write('data: [DONE]\n\n');
         res.end();
+        if (job.metadata.cacheEnabled) {
+          sendCacheStore(job.id, [...effectiveMessages, { role: 'assistant', content: text }]);
+        }
         return;
       }
 
@@ -1341,7 +1819,13 @@ export function createBridgeServer(options = {}) {
           usage,
         }),
       );
+      if (job.metadata.cacheEnabled) {
+        sendCacheStore(job.id, [...effectiveMessages, { role: 'assistant', content: text }]);
+      }
     } catch (error) {
+      if (job?.metadata?.cacheEnabled) {
+        sendCacheDiscard(job.id);
+      }
       const status = error.status || 500;
       const type = error.type || 'api_error';
 
@@ -1427,9 +1911,10 @@ export function createBridgeServer(options = {}) {
     const userMessage = { role: 'user', content };
     session.messages.push(userMessage);
     session.updatedAt = new Date().toISOString();
+    let job;
 
     try {
-      const job = dispatchGeneration({
+      job = dispatchGeneration({
         model: DEFAULT_MODEL,
         messages: session.messages,
         metadata: {
@@ -1437,6 +1922,8 @@ export function createBridgeServer(options = {}) {
           stream,
           messageCount: session.messages.length,
           toolsProvided: 0,
+          cacheEnabled: canUsePromptCache(session.messages, 0),
+          awaitServerStore: false,
         },
         onChunk: stream
           ? ({ delta }) => {
@@ -1479,15 +1966,24 @@ export function createBridgeServer(options = {}) {
         });
         res.write('data: [DONE]\n\n');
         res.end();
+        if (job.metadata.cacheEnabled) {
+          sendCacheStore(job.id, [...session.messages]);
+        }
         return;
       }
 
-      res.json({
-        session: serializeChatSession(session),
-        usage,
-      });
-    } catch (error) {
-      const lastMessage = session.messages.at(-1);
+        res.json({
+          session: serializeChatSession(session),
+          usage,
+        });
+        if (job.metadata.cacheEnabled) {
+          sendCacheStore(job.id, [...session.messages]);
+        }
+      } catch (error) {
+        if (job?.metadata?.cacheEnabled) {
+          sendCacheDiscard(job.id);
+        }
+        const lastMessage = session.messages.at(-1);
       if (lastMessage === userMessage) {
         session.messages.pop();
         session.updatedAt = new Date().toISOString();
@@ -1563,6 +2059,15 @@ export function createBridgeServer(options = {}) {
           promptTokens: Number.isFinite(payload?.usage?.prompt_tokens) ? payload.usage.prompt_tokens : null,
           contextWindow: Number.isFinite(payload?.usage?.context_window) ? payload.usage.context_window : null,
           trimmedMessages: Number.isFinite(payload?.usage?.trimmed_messages) ? payload.usage.trimmed_messages : 0,
+          cacheHit: Boolean(payload?.usage?.cache_hit),
+          cachePrefixMessages: Number.isFinite(payload?.usage?.cache_prefix_messages)
+            ? payload.usage.cache_prefix_messages
+            : 0,
+          cacheSuffixMessages: Number.isFinite(payload?.usage?.cache_suffix_messages)
+            ? payload.usage.cache_suffix_messages
+            : 0,
+          cacheEntries: Number.isFinite(payload?.usage?.cache_entries) ? payload.usage.cache_entries : 0,
+          cacheAwaitingStore: Boolean(payload?.usage?.cache_awaiting_store),
         });
         return;
       }
