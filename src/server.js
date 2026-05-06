@@ -231,7 +231,50 @@ function describeToolChoice(toolChoice) {
   return 'Use tools only when they are needed to answer correctly.';
 }
 
-function buildToolInstruction(tools, toolChoice) {
+function findLastUserMessage(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'user') {
+      return messages[index];
+    }
+  }
+
+  return null;
+}
+
+function buildToolPreferenceHints(messages, tools) {
+  const lastUserMessage = findLastUserMessage(messages);
+  const lastUserContent = flattenContent(lastUserMessage?.content).toLowerCase();
+  if (!lastUserContent) {
+    return [];
+  }
+
+  const toolNames = new Set(tools.map((tool) => tool.function.name));
+  const hints = [];
+  const fileTaskPattern =
+    /\b(file|script|test|tests|python|module|source|code)\b/;
+  const createPattern =
+    /\b(write|create|add|save|generate|make)\b/;
+  const editPattern =
+    /\b(edit|modify|update|change|fix|rewrite|patch|append|replace)\b/;
+  const shellPattern =
+    /\b(run|execute|check|inspect|show|list|print|disk|memory|ram|mount|df|free|ls|cat|python)\b/;
+
+  if (toolNames.has('write') && fileTaskPattern.test(lastUserContent) && createPattern.test(lastUserContent)) {
+    hints.push('If you need to create a new file, prefer the "write" tool instead of "shell".');
+  }
+
+  if (toolNames.has('edit') && fileTaskPattern.test(lastUserContent) && editPattern.test(lastUserContent)) {
+    hints.push('If you need to modify an existing file, prefer the "edit" tool instead of "shell".');
+  }
+
+  if (toolNames.has('shell') && shellPattern.test(lastUserContent) && !createPattern.test(lastUserContent)) {
+    hints.push('If the user asks you to run or inspect commands, prefer the "shell" tool.');
+  }
+
+  return hints;
+}
+
+function buildToolInstruction(tools, toolChoice, messages = []) {
   const serializedTools = JSON.stringify(
     tools.map((tool) => ({
       name: tool.function.name,
@@ -252,6 +295,7 @@ function buildToolInstruction(tools, toolChoice) {
     'If you still choose to wrap a final answer, use {"type":"final","content":"your answer"}.',
     'If the conversation already includes tool results that answer the user, return a final answer instead of repeating the same tool call.',
     describeToolChoice(toolChoice),
+    ...buildToolPreferenceHints(messages, tools),
     'Available tools:',
     serializedTools,
   ].join('\n');
@@ -265,7 +309,7 @@ function prepareMessagesForModel(messages, tools, toolChoice) {
   return [
     {
       role: 'system',
-      content: buildToolInstruction(tools, toolChoice),
+      content: buildToolInstruction(tools, toolChoice, messages),
     },
     ...messages,
   ];
@@ -383,11 +427,26 @@ function resolveAllowedToolName(name, allowedNames) {
 
   const canonicalName = canonicalizeToolName(name);
   const candidates = Array.from(allowedNames).filter((allowedName) => canonicalizeToolName(allowedName) === canonicalName);
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  const looseCandidates = Array.from(allowedNames).filter((allowedName) => {
+    const canonicalAllowedName = canonicalizeToolName(allowedName);
+    return canonicalAllowedName.endsWith(canonicalName) || canonicalName.endsWith(canonicalAllowedName);
+  });
+  if (looseCandidates.length === 1) {
+    return looseCandidates[0];
+  }
+
   return candidates.length === 1 ? candidates[0] : null;
 }
 
 function normalizeToolCall(toolCall, allowedNames, toolDefinitions, index) {
-  const rawName = toolCall?.name ?? toolCall?.function?.name;
+  const rawName =
+    toolCall?.name ??
+    toolCall?.function?.name ??
+    (typeof toolCall?.type === 'string' && toolCall.type !== 'function' ? toolCall.type : null);
   if (typeof rawName !== 'string') {
     return null;
   }
@@ -407,6 +466,25 @@ function normalizeToolCall(toolCall, allowedNames, toolDefinitions, index) {
       arguments: coerceToolArguments(toolCall?.arguments ?? toolCall?.function?.arguments ?? {}, toolDefinition),
     },
     index,
+  };
+}
+
+function looksLikeToolCallResponse(text, parsed) {
+  if (Array.isArray(parsed) || Array.isArray(parsed?.tool_calls) || Array.isArray(parsed?.calls) || parsed?.type === 'tool_calls') {
+    return true;
+  }
+
+  const candidate = stripCodeFence(text);
+  return /"tool_calls"\s*:|```tool_calls```|^\s*\[\s*\{[\s\S]*"arguments"\s*:|^\s*\{\s*"type"\s*:\s*"(?!final")/i.test(candidate);
+}
+
+function buildMalformedToolCallDetails(text, allowedNames, rawToolCalls) {
+  return {
+    allowedToolNames: Array.from(allowedNames),
+    rawToolNames: Array.isArray(rawToolCalls)
+      ? rawToolCalls.map((toolCall) => toolCall?.name ?? toolCall?.function?.name ?? toolCall?.type ?? null)
+      : [],
+    responsePreview: stripCodeFence(text).slice(0, 400),
   };
 }
 
@@ -441,8 +519,15 @@ function normalizeToolModeResponse(text, tools) {
       return {
         kind: 'tool_calls',
         toolCalls,
+        malformedToolCall: null,
       };
     }
+
+    return {
+      kind: 'final',
+      content: text,
+      malformedToolCall: buildMalformedToolCallDetails(text, allowedNames, rawToolCalls),
+    };
   }
 
   if (parsed?.type === 'final' && typeof parsed?.content === 'string') {
@@ -466,7 +551,32 @@ function normalizeToolModeResponse(text, tools) {
   return {
     kind: 'final',
     content: text,
+    malformedToolCall: looksLikeToolCallResponse(text, parsed) ? buildMalformedToolCallDetails(text, allowedNames, null) : null,
   };
+}
+
+function shouldRetryMalformedToolResponse(toolResponse, toolChoice) {
+  return Boolean(
+    toolResponse.kind !== 'tool_calls' &&
+      (toolResponse.malformedToolCall ||
+        toolChoice === 'required' ||
+        (toolChoice?.type === 'function' && typeof toolChoice?.function?.name === 'string')),
+  );
+}
+
+function buildMalformedToolRetryInstruction(tools, toolChoice, messages, malformedToolCall) {
+  const exactToolNames = tools.map((tool) => tool.function.name).join(', ');
+
+  return [
+    'Your previous response looked like an attempted tool call, but it could not be parsed or matched to the available tools.',
+    `Use one of these exact tool names: ${exactToolNames}.`,
+    'Return raw JSON only with no markdown fences and no explanation.',
+    'For one tool call, output exactly {"type":"tool_name","arguments":{}}.',
+    'For multiple tool calls, output exactly {"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{}}]}.',
+    describeToolChoice(toolChoice),
+    ...buildToolPreferenceHints(messages, tools),
+    ...(malformedToolCall?.rawToolNames?.length ? [`Previous tool names: ${malformedToolCall.rawToolNames.join(', ')}`] : []),
+  ].join('\n');
 }
 
 function toolCallName(toolCall) {
@@ -965,12 +1075,53 @@ export function createBridgeServer(options = {}) {
       const { text, usage } = await job.result;
 
       if (toolMode) {
-        const toolResponse = normalizeToolModeResponse(text, tools);
+        let toolResponse = normalizeToolModeResponse(text, tools);
+        let responseJob = job;
+        let responseUsage = usage;
+
+        if (toolResponse.malformedToolCall) {
+          addLog('warn', `Could not normalize tool calls for ${job.id}`, toolResponse.malformedToolCall);
+        }
+
+        if (shouldRetryMalformedToolResponse(toolResponse, toolChoice)) {
+          addLog('warn', `Retrying malformed tool response for ${job.id}`, toolResponse.malformedToolCall ?? null);
+
+          const retryJob = dispatchGeneration({
+            messages: [
+              {
+                role: 'system',
+                content: buildToolInstruction(tools, toolChoice, messages),
+              },
+              {
+                role: 'system',
+                content: buildMalformedToolRetryInstruction(tools, toolChoice, messages, toolResponse.malformedToolCall),
+              },
+              ...messages,
+            ],
+            model,
+            metadata: {
+              source: 'openai-chat',
+              stream,
+              messageCount: messages.length + 2,
+              toolsProvided: tools.length,
+            },
+          });
+
+          const retryResult = await retryJob.result;
+          const repairedResponse = normalizeToolModeResponse(retryResult.text, tools);
+          if (repairedResponse.malformedToolCall) {
+            addLog('warn', `Tool response remained malformed after retry for ${retryJob.id}`, repairedResponse.malformedToolCall);
+          }
+
+          toolResponse = repairedResponse;
+          responseJob = retryJob;
+          responseUsage = retryResult.usage;
+        }
 
         if (toolResponse.kind === 'tool_calls') {
           if (isDuplicateToolResponse(messages, toolResponse.toolCalls)) {
-            job.metadata.duplicateRetry = true;
-            addLog('warn', `Retrying duplicate tool calls for ${job.id}`, {
+            responseJob.metadata.duplicateRetry = true;
+            addLog('warn', `Retrying duplicate tool calls for ${responseJob.id}`, {
               toolCalls: toolResponse.toolCalls.map((toolCall) => ({
                 name: toolCall.function.name,
                 arguments: toolCall.function.arguments,
@@ -1014,30 +1165,30 @@ export function createBridgeServer(options = {}) {
             const retryTrailingContent = stream ? extractDelta(retryJob.outputText, finalRetryResponse.content) : '';
             retryJob.metadata.finishReason = 'stop';
 
-            if (stream) {
-              if (retryTrailingContent) {
-                writeSse(
-                  res,
-                  chatChunkPayload({
+              if (stream) {
+                if (retryTrailingContent) {
+                  writeSse(
+                    res,
+                    chatChunkPayload({
                     id: retryJob.id,
                     created: retryJob.created,
                     model: retryJob.model,
                     delta: { content: retryTrailingContent },
-                  }),
-                );
-              }
-              writeSse(
-                res,
+                    }),
+                  );
+                }
+                writeSse(
+                  res,
                 chatChunkPayload({
                   id: retryJob.id,
                   created: retryJob.created,
                   model: retryJob.model,
                   delta: {},
                   finishReason: 'stop',
-                  usage: streamOptions?.include_usage ? retryResult.usage : undefined,
-                }),
-              );
-              res.write('data: [DONE]\n\n');
+                    usage: streamOptions?.include_usage ? retryResult.usage : undefined,
+                  }),
+                );
+                res.write('data: [DONE]\n\n');
               res.end();
               return;
             }
@@ -1054,8 +1205,8 @@ export function createBridgeServer(options = {}) {
             return;
           }
 
-          job.metadata.toolCallsReturned = toolResponse.toolCalls.length;
-          job.metadata.finishReason = 'tool_calls';
+          responseJob.metadata.toolCallsReturned = toolResponse.toolCalls.length;
+          responseJob.metadata.finishReason = 'tool_calls';
           const toolCalls = toolResponse.toolCalls.map(({ index, ...toolCall }) => toolCall);
 
           if (stream) {
@@ -1063,9 +1214,9 @@ export function createBridgeServer(options = {}) {
               writeSse(
                 res,
                 chatChunkPayload({
-                  id: job.id,
-                  created: job.created,
-                  model: job.model,
+                  id: responseJob.id,
+                  created: responseJob.created,
+                  model: responseJob.model,
                   delta: {
                     tool_calls: [
                       {
@@ -1083,12 +1234,12 @@ export function createBridgeServer(options = {}) {
             writeSse(
               res,
               chatChunkPayload({
-                id: job.id,
-                created: job.created,
-                model: job.model,
+                id: responseJob.id,
+                created: responseJob.created,
+                model: responseJob.model,
                 delta: {},
                 finishReason: 'tool_calls',
-                usage: streamOptions?.include_usage ? usage : undefined,
+                usage: streamOptions?.include_usage ? responseUsage : undefined,
               }),
             );
             res.write('data: [DONE]\n\n');
@@ -1098,36 +1249,40 @@ export function createBridgeServer(options = {}) {
 
           res.json(
             chatToolCompletionPayload({
-              id: job.id,
-              created: job.created,
-              model: job.model,
+              id: responseJob.id,
+              created: responseJob.created,
+              model: responseJob.model,
               toolCalls,
-              usage,
+              usage: responseUsage,
             }),
           );
           return;
         }
 
-        job.metadata.finishReason = 'stop';
+        responseJob.metadata.finishReason = 'stop';
         if (stream) {
+          const trailingContent = extractDelta(responseJob.outputText, toolResponse.content);
+          const contentDelta = trailingContent || toolResponse.content;
+          if (contentDelta) {
+            writeSse(
+              res,
+              chatChunkPayload({
+                id: responseJob.id,
+                created: responseJob.created,
+                model: responseJob.model,
+                delta: { content: contentDelta },
+              }),
+            );
+          }
           writeSse(
             res,
             chatChunkPayload({
-              id: job.id,
-              created: job.created,
-              model: job.model,
-              delta: { content: toolResponse.content },
-            }),
-          );
-          writeSse(
-            res,
-            chatChunkPayload({
-              id: job.id,
-              created: job.created,
-              model: job.model,
+              id: responseJob.id,
+              created: responseJob.created,
+              model: responseJob.model,
               delta: {},
               finishReason: 'stop',
-              usage: streamOptions?.include_usage ? usage : undefined,
+              usage: streamOptions?.include_usage ? responseUsage : undefined,
             }),
           );
           res.write('data: [DONE]\n\n');
@@ -1137,11 +1292,11 @@ export function createBridgeServer(options = {}) {
 
         res.json(
           chatCompletionPayload({
-            id: job.id,
-            created: job.created,
-            model: job.model,
+            id: responseJob.id,
+            created: responseJob.created,
+            model: responseJob.model,
             text: toolResponse.content,
-            usage,
+            usage: responseUsage,
           }),
         );
         return;

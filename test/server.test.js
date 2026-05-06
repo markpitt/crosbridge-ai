@@ -655,6 +655,169 @@ test('coerces shorthand string tool arguments into JSON object parameters', asyn
   await bridgeServer.close();
 });
 
+test('biases file-creation requests toward write instead of shell', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  await onceOpen(socket);
+  await readyBridge(socket);
+
+  const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'chrome-prompt-api',
+      messages: [
+        {
+          role: 'user',
+          content: 'Write a Python script and add a second test file.',
+        },
+      ],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'write',
+            description: 'Write a file.',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string' },
+                content: { type: 'string' },
+              },
+              required: ['path', 'content'],
+            },
+          },
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'shell',
+            description: 'Run a shell command.',
+            parameters: {
+              type: 'object',
+              properties: {
+                command: { type: 'string' },
+              },
+              required: ['command'],
+            },
+          },
+        },
+      ],
+    }),
+  });
+
+  const generateMessage = await onceMessage(socket, (payload) => payload.type === 'generate');
+  assert.match(generateMessage.payload.promptText, /prefer the "write" tool instead of "shell"/i);
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: generateMessage.requestId,
+      text: '{"type":"write","arguments":{"path":"/tmp/example.py","content":"print(1)"}}',
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 4,
+      },
+    }),
+  );
+
+  const response = await requestPromise;
+  const body = await response.json();
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(body.choices[0].message.tool_calls[0].function.name, 'write');
+
+  const closed = onceClose(socket);
+  socket.close();
+  await closed;
+  await bridgeServer.close();
+});
+
+test('retries malformed tool-call-shaped output once before falling back to text', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  await onceOpen(socket);
+  await readyBridge(socket);
+
+  const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'chrome-prompt-api',
+      messages: [{ role: 'user', content: 'Write a file to /tmp/example.py.' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'write',
+            description: 'Write a file.',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string' },
+                content: { type: 'string' },
+              },
+              required: ['path', 'content'],
+            },
+          },
+        },
+      ],
+    }),
+  });
+
+  const firstGenerate = await onceMessage(socket, (payload) => payload.type === 'generate');
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: firstGenerate.requestId,
+      text: '{"type":"tool_calls","tool_calls":[{"arguments":{"path":"/tmp/example.py","content":"print(1)"}}]}',
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 6,
+      },
+    }),
+  );
+
+  const secondGenerate = await onceMessage(socket, (payload) => payload.type === 'generate');
+  assert.match(secondGenerate.payload.promptText, /could not be parsed or matched/i);
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: secondGenerate.requestId,
+      text: '{"type":"write","arguments":{"path":"/tmp/example.py","content":"print(1)"}}',
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 4,
+      },
+    }),
+  );
+
+  const response = await requestPromise;
+  const body = await response.json();
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(body.choices[0].message.tool_calls[0].function.name, 'write');
+
+  const statusResponse = await fetch(`http://127.0.0.1:${port}/api/status`);
+  const statusBody = await statusResponse.json();
+  const malformedLog = statusBody.logs.find((entry) => entry.message === `Could not normalize tool calls for ${firstGenerate.requestId}`);
+  const retryLog = statusBody.logs.find((entry) => entry.message === `Retrying malformed tool response for ${firstGenerate.requestId}`);
+  assert.ok(malformedLog);
+  assert.ok(retryLog);
+
+  const closed = onceClose(socket);
+  socket.close();
+  await closed;
+  await bridgeServer.close();
+});
+
 test('retries once when the model repeats an already-executed tool call', async () => {
   const bridgeServer = createBridgeServer();
   await bridgeServer.listen(0);
