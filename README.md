@@ -168,6 +168,12 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 - simple server-backed multi-turn chat UI
 - terminal logging with request metrics
 
+## 🚧 Future improvement
+
+Chrome's web Prompt API currently supports the base model session path used by this bridge, but native browser-side Prompt API tool use is not yet reliably available in this localhost web setup. When that changes, the best next step is to move tool execution into the browser-side Prompt API session and keep that session alive across OpenAI tool round trips.
+
+See [`TODO.md`](./TODO.md) for the deferred design, wire protocol, resume logic, fallback requirements, and test plan needed to rebuild that implementation.
+
 ## 🔌 API notes
 
 Supported request fields on `chat.completions`:
