@@ -2,11 +2,11 @@
 
 🚀 OpenAI-compatible local bridge from **ChromeOS Prompt API** to **Crostini apps**.
 
-`crosbridge-ai` lets Linux tools inside Crostini talk to Chrome's on-device model through a normal local OpenAI-style API. That means existing clients such as Goose can use ChromeOS edge AI without needing a custom provider or a heavyweight local model runtime.
+`crosbridge-ai` lets Linux tools inside Crostini talk to Chrome's on-device model through a normal local OpenAI-style API. That means existing clients such as Goose can use ChromeOS edge AI, including the device's on-device acceleration path, without needing a custom provider or a heavyweight local model runtime.
 
 ## ✨ Why this exists
 
-Chrome can access the built-in Prompt API, but Crostini apps cannot use it directly. This bridge fills that gap:
+Chrome can access the built-in Prompt API and the device's on-device AI acceleration path, but Crostini apps cannot use that path directly. In practice, this means Chrome can reach hardware-backed inference such as the NPU while the Linux container cannot. This bridge fills that gap:
 
 - Chrome hosts the model session
 - Crostini gets `POST /v1/chat/completions` and `GET /v1/models`
