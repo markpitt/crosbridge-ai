@@ -1,0 +1,19 @@
+{
+  "name": "crosbridge-ai",
+  "version": "0.1.0",
+  "description": "OpenAI-compatible ChromeOS Prompt API bridge for Crostini",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "express": "^5.2.1",
+    "marked": "^18.0.3",
+    "ws": "^8.20.0"
+  }
+}

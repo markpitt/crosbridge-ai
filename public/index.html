@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chrome Prompt API Bridge</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header class="hero">
+        <div>
+          <h1>Chrome Prompt API Bridge</h1>
+          <p>Open this page in ChromeOS to connect the browser Prompt API to the local OpenAI-compatible endpoint.</p>
+        </div>
+        <div class="badges">
+          <span id="connection-pill" class="pill pill-warn">Disconnected</span>
+          <span id="prompt-pill" class="pill pill-warn">Prompt API unknown</span>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>How to use</h2>
+        <ol>
+          <li>Start the server in Crostini with <code>npm start</code> or <code>node src/server.js --no-open</code>.</li>
+          <li>Let the server open this page automatically, or paste the printed URL into ChromeOS.</li>
+          <li>Send OpenAI-compatible requests to <code>/v1/chat/completions</code>.</li>
+        </ol>
+        <pre><code>curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local" \
+  -d '{
+    "model": "chrome-prompt-api",
+    "messages": [
+      {"role": "system", "content": "You are concise."},
+      {"role": "user", "content": "Explain the Django ORM in one paragraph."}
+    ],
+    "stream": true
+  }'</code></pre>
+      </section>
+
+      <section class="panel">
+        <div class="chat-header">
+          <h2>Local chat</h2>
+          <button id="new-chat" type="button">New chat</button>
+        </div>
+        <div id="chat-messages" class="chat-messages"></div>
+        <form id="chat-form" class="chat-form">
+          <textarea
+            id="chat-input"
+            rows="4"
+            placeholder="Ask something with your previous turns kept as context..."
+          ></textarea>
+          <button id="chat-send" type="submit">Send</button>
+        </form>
+      </section>
+
+      <section class="stats-grid">
+        <article class="panel">
+          <h2>Bridge status</h2>
+          <dl class="stats">
+            <div><dt>Browser</dt><dd id="browser-status">Disconnected</dd></div>
+            <div><dt>Prompt API</dt><dd id="prompt-status">Unknown</dd></div>
+            <div><dt>Active requests</dt><dd id="active-requests">0</dd></div>
+            <div><dt>Completed</dt><dd id="completed-requests">0</dd></div>
+            <div><dt>Failed</dt><dd id="failed-requests">0</dd></div>
+          </dl>
+        </article>
+
+        <article class="panel">
+          <h2>Totals</h2>
+          <dl class="stats">
+            <div><dt>Words in</dt><dd id="words-in">0</dd></div>
+            <div><dt>Words out</dt><dd id="words-out">0</dd></div>
+            <div><dt>Est. tokens in</dt><dd id="tokens-in">0</dd></div>
+            <div><dt>Est. tokens out</dt><dd id="tokens-out">0</dd></div>
+            <div><dt>Requests</dt><dd id="total-requests">0</dd></div>
+          </dl>
+        </article>
+      </section>
+
+      <section class="panel">
+        <h2>Recent logs</h2>
+        <pre id="logs" class="logs">Waiting for the browser bridge...</pre>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
