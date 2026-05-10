@@ -1449,6 +1449,11 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
+    if (model !== DEFAULT_MODEL) {
+      res.status(404).json(openAiError(`The model "${model}" does not exist.`, 'invalid_request_error'));
+      return;
+    }
+
     const tools = normalizeTools(requestedTools);
     const toolMode = tools.length > 0 && toolChoice !== 'none';
     const effectiveMessages = prepareMessagesForModel(messages, tools, toolChoice);

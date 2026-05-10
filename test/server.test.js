@@ -114,6 +114,30 @@ test('rejects browser bridge sockets from a different browser origin', async () 
   await bridgeServer.close();
 });
 
+test('rejects chat completions for unknown models', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'not-a-real-model',
+      messages: [{ role: 'user', content: 'Hello' }],
+    }),
+  });
+
+  assert.equal(response.status, 404);
+  const body = await response.json();
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.match(body.error.message, /not-a-real-model/);
+
+  await bridgeServer.close();
+});
+
 test('builds prompt transcripts with tool calls and tool outputs', () => {
   const prompt = buildPrompt([
     { role: 'system', content: 'You are helpful.' },
