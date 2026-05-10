@@ -2,7 +2,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL, URL } from 'node:url';
 
 import Ajv from 'ajv';
 import express from 'express';
@@ -1092,6 +1092,7 @@ export function createBridgeServer(options = {}) {
   const state = {
     browser: null,
     browserInfo: null,
+    bridgeToken: randomUUID(),
     logs: [],
     jobs: new Map(),
     sessions: new Map(),
@@ -1329,6 +1330,26 @@ export function createBridgeServer(options = {}) {
       type: 'cache-discard',
       requestId,
     });
+  }
+
+  function isAllowedBridgeRequest(req) {
+    const requestUrl = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+    if (requestUrl.searchParams.get('token') !== state.bridgeToken) {
+      return false;
+    }
+
+    const origin = req.headers.origin;
+    if (!origin) {
+      return true;
+    }
+
+    try {
+      const originUrl = new URL(origin);
+      const expectedOrigin = new URL(`http://${req.headers.host || config.host}`).origin;
+      return originUrl.origin === expectedOrigin;
+    } catch {
+      return false;
+    }
   }
 
   function dispatchGeneration({ messages, model = DEFAULT_MODEL, onChunk, metadata }) {
@@ -1851,6 +1872,12 @@ export function createBridgeServer(options = {}) {
     res.json(getStatusPayload());
   });
 
+  app.get('/api/bridge-config', (_req, res) => {
+    res.json({
+      token: state.bridgeToken,
+    });
+  });
+
   app.get('/health', (_req, res) => {
     res.json({
       ok: true,
@@ -2008,7 +2035,12 @@ export function createBridgeServer(options = {}) {
     }
   });
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
+    if (!isAllowedBridgeRequest(req)) {
+      ws.close(1008, 'Invalid bridge credentials');
+      return;
+    }
+
       if (state.browser && state.browser !== ws) {
         for (const job of Array.from(state.jobs.values())) {
           rejectJob(job, 503, 'The browser bridge was replaced while requests were in progress.', 'bridge_replaced', 'bridge_replaced');

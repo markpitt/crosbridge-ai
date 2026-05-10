@@ -705,9 +705,20 @@ async function runRequest(socket, message) {
   }
 }
 
-function connect() {
+async function connect() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socket = new WebSocket(`${protocol}//${window.location.host}/bridge`);
+  let bridgeToken;
+
+  try {
+    const config = await requestJson('/api/bridge-config');
+    bridgeToken = config.token;
+  } catch (error) {
+    appendLog(`Failed to load bridge configuration: ${formatError(error)}`);
+    window.setTimeout(connect, 2000);
+    return;
+  }
+
+  const socket = new WebSocket(`${protocol}//${window.location.host}/bridge?token=${encodeURIComponent(bridgeToken)}`);
 
   socket.addEventListener('open', () => {
     appendLog('Connected to local bridge server');

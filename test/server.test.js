@@ -15,7 +15,7 @@ function onceOpen(socket) {
 
 function onceClose(socket) {
   return new Promise((resolve) => {
-    socket.once('close', resolve);
+    socket.once('close', (code, reason) => resolve({ code, reason: String(reason) }));
   });
 }
 
@@ -56,6 +56,15 @@ async function readyBridge(socket) {
   );
 }
 
+async function openBridgeSocket(port, options = {}) {
+  const configResponse = await fetch(`http://127.0.0.1:${port}/api/bridge-config`);
+  assert.equal(configResponse.status, 200);
+  const config = await configResponse.json();
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge?token=${encodeURIComponent(config.token)}`, options);
+  await onceOpen(socket);
+  return socket;
+}
+
 test('lists the available OpenAI models', async () => {
   const bridgeServer = createBridgeServer();
   await bridgeServer.listen(0);
@@ -67,6 +76,40 @@ test('lists the available OpenAI models', async () => {
   const body = await response.json();
   assert.equal(body.object, 'list');
   assert.equal(body.data[0].id, 'chrome-prompt-api');
+
+  await bridgeServer.close();
+});
+
+test('rejects browser bridge sockets without the bridge token', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  await onceOpen(socket);
+  const close = await onceClose(socket);
+  assert.equal(close.code, 1008);
+  assert.equal(bridgeServer.state.browser, null);
+
+  await bridgeServer.close();
+});
+
+test('rejects browser bridge sockets from a different browser origin', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const configResponse = await fetch(`http://127.0.0.1:${port}/api/bridge-config`);
+  const config = await configResponse.json();
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge?token=${encodeURIComponent(config.token)}`, {
+    headers: {
+      Origin: 'http://malicious.local',
+    },
+  });
+  await onceOpen(socket);
+  const close = await onceClose(socket);
+  assert.equal(close.code, 1008);
+  assert.equal(bridgeServer.state.browser, null);
 
   await bridgeServer.close();
 });
@@ -147,8 +190,7 @@ test('returns a non-streaming OpenAI chat completion from the browser bridge', a
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -211,8 +253,7 @@ test('records browser prompt-cache metrics in request logs', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -295,8 +336,7 @@ test('streams SSE chat completion chunks from the browser bridge', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const responsePromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -353,8 +393,7 @@ test('streams the final response text when the browser sends no intermediate chu
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const responsePromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -415,8 +454,7 @@ test('keeps multi-turn chat history on the server for the hosted page', async ()
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const createResponse = await fetch(`http://127.0.0.1:${port}/api/chat/sessions`, {
@@ -494,8 +532,7 @@ test('streams hosted chat responses and persists the assistant message', async (
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const createResponse = await fetch(`http://127.0.0.1:${port}/api/chat/sessions`, {
@@ -558,8 +595,7 @@ test('returns OpenAI-style tool calls when tools are provided', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -635,8 +671,7 @@ test('accepts Goose-style fenced tool call arrays', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -696,8 +731,7 @@ test('accepts single-object shorthand tool calls', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -757,8 +791,7 @@ test('coerces shorthand string tool arguments into JSON object parameters', asyn
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -818,8 +851,7 @@ test('biases file-creation requests toward write instead of shell', async () => 
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -899,8 +931,7 @@ test('retries malformed tool-call-shaped output once before falling back to text
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -981,8 +1012,7 @@ test('recovers escaped stringified tool JSON with local repairs before regenerat
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -1050,8 +1080,7 @@ test('recovers write tool calls with unescaped inner quotes', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -1115,8 +1144,7 @@ test('retries malformed tool-call-shaped output up to a second repair generation
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -1212,8 +1240,7 @@ test('retries once when the model repeats an already-executed tool call', async 
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -1308,8 +1335,7 @@ test('salvages malformed wrapped final answers in tool mode', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -1391,8 +1417,7 @@ test('surfaces context-length errors from the browser bridge', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const requestPromise = fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -1439,8 +1464,7 @@ test('supports configuring a shorter request timeout', async () => {
   await bridgeServer.listen(0);
   const { port } = bridgeServer.server.address();
 
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-  await onceOpen(socket);
+  const socket = await openBridgeSocket(port);
   await readyBridge(socket);
 
   const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
