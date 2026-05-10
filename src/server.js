@@ -13,6 +13,7 @@ import { buildPrompt, flattenContent } from '../public/lib/prompt-cache.js';
 import { BASE_SYSTEM_PROMPT } from '../public/lib/prompt-constants.js';
 
 const DEFAULT_PORT = Number(process.env.PORT || 8787);
+const DEFAULT_HOST = process.env.HOST || '127.0.0.1';
 const DEFAULT_MODEL = 'chrome-prompt-api';
 const DEFAULT_REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 300000);
 const MAX_LOG_ENTRIES = 200;
@@ -1083,6 +1084,7 @@ export function createBridgeServer(options = {}) {
   const wss = new WebSocketServer({ server, path: '/bridge' });
   const config = {
     openBrowser: options.openBrowser ?? false,
+    host: options.host ?? DEFAULT_HOST,
     port: options.port ?? DEFAULT_PORT,
     requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
   };
@@ -2132,7 +2134,7 @@ export function createBridgeServer(options = {}) {
     });
   });
 
-  async function listen(port = config.port) {
+  async function listen(port = config.port, host = config.host) {
     await new Promise((resolve, reject) => {
       const onError = (error) => {
         server.off('error', onError);
@@ -2140,7 +2142,7 @@ export function createBridgeServer(options = {}) {
       };
 
       server.on('error', onError);
-      server.listen(port, () => {
+      server.listen(port, host, () => {
         server.off('error', onError);
         resolve();
       });
@@ -2148,7 +2150,7 @@ export function createBridgeServer(options = {}) {
 
     const address = server.address();
     const actualPort = typeof address === 'object' && address ? address.port : port;
-    const url = `http://127.0.0.1:${actualPort}`;
+    const url = `http://${host}:${actualPort}`;
 
     addLog('info', `Server listening on ${url}`);
     console.log(`Bridge listening at ${url}`);
