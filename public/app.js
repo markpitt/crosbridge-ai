@@ -57,6 +57,86 @@ function escapeHtml(text) {
     .replaceAll('>', '&gt;');
 }
 
+function sanitizeUrl(value) {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const url = new URL(trimmed, window.location.origin);
+    return ['http:', 'https:', 'mailto:'].includes(url.protocol) ? trimmed : null;
+  } catch {
+    return trimmed.startsWith('#') || trimmed.startsWith('/') ? trimmed : null;
+  }
+}
+
+function sanitizeRenderedMarkdown(html) {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+
+  const allowedElements = new Set([
+    'A',
+    'BLOCKQUOTE',
+    'BR',
+    'CODE',
+    'DEL',
+    'EM',
+    'H1',
+    'H2',
+    'H3',
+    'H4',
+    'H5',
+    'H6',
+    'HR',
+    'LI',
+    'OL',
+    'P',
+    'PRE',
+    'STRONG',
+    'TABLE',
+    'TBODY',
+    'TD',
+    'TH',
+    'THEAD',
+    'TR',
+    'UL',
+  ]);
+  const removeWithChildren = new Set(['IFRAME', 'OBJECT', 'SCRIPT', 'STYLE', 'TEMPLATE']);
+
+  for (const element of [...template.content.querySelectorAll('*')]) {
+    if (removeWithChildren.has(element.tagName)) {
+      element.remove();
+      continue;
+    }
+
+    if (!allowedElements.has(element.tagName)) {
+      element.replaceWith(...element.childNodes);
+      continue;
+    }
+
+    if (element.tagName === 'A') {
+      const href = sanitizeUrl(element.getAttribute('href'));
+      for (const attribute of [...element.attributes]) {
+        element.removeAttribute(attribute.name);
+      }
+
+      if (href) {
+        element.setAttribute('href', href);
+        element.setAttribute('rel', 'noopener noreferrer');
+      }
+
+      continue;
+    }
+
+    for (const attribute of [...element.attributes]) {
+      element.removeAttribute(attribute.name);
+    }
+  }
+
+  return template.innerHTML;
+}
+
 function renderLocalLogs(serverLogs = state.serverLogs) {
   state.serverLogs = serverLogs;
   const localLogLines = state.localLogs.map((entry) => `[${entry.ts}] LOCAL ${entry.message}`);
@@ -127,13 +207,14 @@ function renderChat() {
   chatMessages.innerHTML = state.chatSession.messages
     .map((message) => {
       const role = String(message.role || 'assistant');
+      const roleClass = role.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
       const content = flattenContent(message.content);
       const renderedContent =
         role === 'assistant'
-          ? marked.parse(content)
+          ? sanitizeRenderedMarkdown(marked.parse(content))
           : `<div class="chat-plain">${escapeHtml(content).replaceAll('\n', '<br>')}</div>`;
       return `
-        <article class="chat-message chat-message-${role}">
+        <article class="chat-message chat-message-${roleClass}">
           <header>${escapeHtml(role)}</header>
           <div class="chat-body">${renderedContent}</div>
         </article>
