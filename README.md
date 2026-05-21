@@ -161,6 +161,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 - OpenAI-compatible `POST /v1/chat/completions`
 - OpenAI-compatible `GET /v1/models`
+- Anthropic-compatible text `POST /v1/messages`
 - SSE streaming and non-streaming responses
 - OpenAI-style `tools` / `tool_calls`
 - bounded local/model repair for malformed tool-call JSON
@@ -208,6 +209,16 @@ Supported request fields on `chat.completions`:
 - `tool_choice`
 
 Unsupported OpenAI fields are currently ignored.
+
+Supported request fields on Anthropic `messages`:
+
+- `model` (`chrome-prompt-api`)
+- `max_tokens`
+- `messages`
+- `system`
+- `stream`
+
+The Anthropic endpoint supports text content blocks and Anthropic-style SSE events. Tool use and image blocks are not implemented for this endpoint.
 
 ## 🛠️ Operational notes
 

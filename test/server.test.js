@@ -272,6 +272,163 @@ test('returns a non-streaming OpenAI chat completion from the browser bridge', a
   await bridgeServer.close();
 });
 
+test('returns a non-streaming Anthropic message from the browser bridge', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = await openBridgeSocket(port);
+  await readyBridge(socket);
+
+  const requestPromise = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'x-api-key': 'local',
+    },
+    body: JSON.stringify({
+      model: 'chrome-prompt-api',
+      max_tokens: 1024,
+      system: 'You are concise.',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'Say hello.',
+            },
+          ],
+        },
+      ],
+    }),
+  });
+
+  const generateMessage = await onceMessage(socket, (payload) => payload.type === 'generate');
+  assert.match(generateMessage.payload.promptText, /SYSTEM: You are concise\./);
+  assert.match(generateMessage.payload.promptText, /USER: Say hello\./);
+
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: generateMessage.requestId,
+      text: 'Hello from Chrome.',
+      usage: {
+        prompt_tokens: 5,
+        completion_tokens: 4,
+      },
+    }),
+  );
+
+  const response = await requestPromise;
+  assert.equal(response.status, 200);
+
+  const body = await response.json();
+  assert.equal(body.type, 'message');
+  assert.match(body.id, /^msg_/);
+  assert.equal(body.role, 'assistant');
+  assert.equal(body.model, 'chrome-prompt-api');
+  assert.deepEqual(body.content, [{ type: 'text', text: 'Hello from Chrome.' }]);
+  assert.equal(body.stop_reason, 'end_turn');
+  assert.deepEqual(body.usage, {
+    input_tokens: 5,
+    output_tokens: 4,
+  });
+
+  const closed = onceClose(socket);
+  socket.close();
+  await closed;
+  await bridgeServer.close();
+});
+
+test('streams Anthropic message events from the browser bridge', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const socket = await openBridgeSocket(port);
+  await readyBridge(socket);
+
+  const responsePromise = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'x-api-key': 'local',
+    },
+    body: JSON.stringify({
+      model: 'chrome-prompt-api',
+      max_tokens: 1024,
+      stream: true,
+      messages: [{ role: 'user', content: 'Count to two.' }],
+    }),
+  });
+
+  const generateMessage = await onceMessage(socket, (payload) => payload.type === 'generate');
+  socket.send(JSON.stringify({ type: 'job-chunk', requestId: generateMessage.requestId, delta: 'One, ' }));
+  socket.send(
+    JSON.stringify({
+      type: 'job-complete',
+      requestId: generateMessage.requestId,
+      text: 'One, two.',
+      usage: {
+        prompt_tokens: 6,
+        completion_tokens: 3,
+      },
+    }),
+  );
+
+  const response = await responsePromise;
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type') || '', /text\/event-stream/);
+
+  const body = await response.text();
+  assert.match(body, /event: message_start/);
+  assert.match(body, /"type":"message_start"/);
+  assert.match(body, /event: content_block_start/);
+  assert.match(body, /event: content_block_delta/);
+  assert.match(body, /"text":"One, "/);
+  assert.match(body, /"text":"two\."/);
+  assert.match(body, /event: content_block_stop/);
+  assert.match(body, /event: message_delta/);
+  assert.match(body, /"stop_reason":"end_turn"/);
+  assert.match(body, /event: message_stop/);
+
+  const closed = onceClose(socket);
+  socket.close();
+  await closed;
+  await bridgeServer.close();
+});
+
+test('rejects Anthropic messages for unknown models', async () => {
+  const bridgeServer = createBridgeServer();
+  await bridgeServer.listen(0);
+  const { port } = bridgeServer.server.address();
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'x-api-key': 'local',
+    },
+    body: JSON.stringify({
+      model: 'not-a-real-model',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+    }),
+  });
+
+  assert.equal(response.status, 404);
+  const body = await response.json();
+  assert.equal(body.type, 'error');
+  assert.equal(body.error.type, 'not_found_error');
+  assert.match(body.error.message, /not-a-real-model/);
+
+  await bridgeServer.close();
+});
+
 test('records browser prompt-cache metrics in request logs', async () => {
   const bridgeServer = createBridgeServer();
   await bridgeServer.listen(0);

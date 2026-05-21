@@ -130,6 +130,41 @@ function chatToolCompletionPayload({ id, created, model, toolCalls, usage }) {
   };
 }
 
+function anthropicError(message, type = 'invalid_request_error') {
+  return {
+    type: 'error',
+    error: {
+      type,
+      message,
+    },
+  };
+}
+
+function anthropicUsage(usage = {}) {
+  return {
+    input_tokens: Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens : 0,
+    output_tokens: Number.isFinite(usage.completion_tokens) ? usage.completion_tokens : 0,
+  };
+}
+
+function anthropicMessagePayload({ id, model, text, usage, stopReason = 'end_turn' }) {
+  return {
+    id,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [
+      {
+        type: 'text',
+        text,
+      },
+    ],
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: anthropicUsage(usage),
+  };
+}
+
 function modelPayload(id = DEFAULT_MODEL) {
   return {
     id,
@@ -147,6 +182,11 @@ function writeSse(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function writeNamedSse(res, event, payload) {
+  res.write(`event: ${event}\n`);
+  writeSse(res, payload);
+}
+
 function openSse(res) {
   res.status(200);
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -161,6 +201,52 @@ function normalizeTools(tools) {
   }
 
   return tools.filter((tool) => tool?.type === 'function' && typeof tool?.function?.name === 'string');
+}
+
+function flattenAnthropicContent(content) {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => {
+        if (typeof block === 'string') {
+          return block;
+        }
+
+        if (block?.type === 'text' && typeof block.text === 'string') {
+          return block.text;
+        }
+
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  return '';
+}
+
+function normalizeAnthropicMessages(messages, system) {
+  const normalizedMessages = [];
+  const systemContent = flattenAnthropicContent(system);
+  if (systemContent) {
+    normalizedMessages.push({ role: 'system', content: systemContent });
+  }
+
+  for (const message of messages) {
+    if (message?.role !== 'user' && message?.role !== 'assistant') {
+      return null;
+    }
+
+    normalizedMessages.push({
+      role: message.role,
+      content: flattenAnthropicContent(message.content),
+    });
+  }
+
+  return normalizedMessages;
 }
 
 function buildToolDefinitionMap(tools) {
@@ -1868,6 +1954,162 @@ export function createBridgeServer(options = {}) {
     }
   }
 
+  async function handleAnthropicMessages(req, res) {
+    const {
+      messages,
+      model,
+      max_tokens: maxTokens,
+      stream = false,
+      system,
+    } = req.body ?? {};
+
+    if (model !== DEFAULT_MODEL) {
+      res.status(404).json(anthropicError(`The model "${model}" does not exist.`, 'not_found_error'));
+      return;
+    }
+
+    if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
+      res.status(400).json(anthropicError('The request body must include a positive integer max_tokens.'));
+      return;
+    }
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      res.status(400).json(anthropicError('The request body must include a non-empty messages array.'));
+      return;
+    }
+
+    const effectiveMessages = normalizeAnthropicMessages(messages, system);
+    if (!effectiveMessages) {
+      res.status(400).json(anthropicError('Messages must use role "user" or "assistant".'));
+      return;
+    }
+
+    const messageId = `msg_${randomUUID().replaceAll('-', '')}`;
+    let job;
+
+    try {
+      job = dispatchGeneration({
+        messages: effectiveMessages,
+        model,
+        metadata: {
+          source: 'anthropic-messages',
+          stream,
+          messageCount: messages.length,
+          toolsProvided: 0,
+          cacheEnabled: canUsePromptCache(effectiveMessages, 0),
+          awaitServerStore: false,
+        },
+        onChunk: ({ delta }) => {
+          if (!stream || res.writableEnded) {
+            return;
+          }
+
+          writeNamedSse(res, 'content_block_delta', {
+            type: 'content_block_delta',
+            index: 0,
+            delta: {
+              type: 'text_delta',
+              text: delta,
+            },
+          });
+        },
+      });
+
+      if (stream) {
+        openSse(res);
+        writeNamedSse(res, 'message_start', {
+          type: 'message_start',
+          message: {
+            id: messageId,
+            type: 'message',
+            role: 'assistant',
+            model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: {
+              input_tokens: estimateTokens(job.promptText),
+              output_tokens: 0,
+            },
+          },
+        });
+        writeNamedSse(res, 'content_block_start', {
+          type: 'content_block_start',
+          index: 0,
+          content_block: {
+            type: 'text',
+            text: '',
+          },
+        });
+      }
+
+      const { text, usage } = await job.result;
+
+      if (stream) {
+        const trailingContent = extractDelta(job.outputText, text);
+        if (trailingContent) {
+          writeNamedSse(res, 'content_block_delta', {
+            type: 'content_block_delta',
+            index: 0,
+            delta: {
+              type: 'text_delta',
+              text: trailingContent,
+            },
+          });
+        }
+
+        writeNamedSse(res, 'content_block_stop', {
+          type: 'content_block_stop',
+          index: 0,
+        });
+        writeNamedSse(res, 'message_delta', {
+          type: 'message_delta',
+          delta: {
+            stop_reason: 'end_turn',
+            stop_sequence: null,
+          },
+          usage: {
+            output_tokens: anthropicUsage(usage).output_tokens,
+          },
+        });
+        writeNamedSse(res, 'message_stop', {
+          type: 'message_stop',
+        });
+        res.end();
+        if (job.metadata.cacheEnabled) {
+          sendCacheStore(job.id, [...effectiveMessages, { role: 'assistant', content: text }]);
+        }
+        return;
+      }
+
+      res.json(
+        anthropicMessagePayload({
+          id: messageId,
+          model,
+          text,
+          usage,
+        }),
+      );
+      if (job.metadata.cacheEnabled) {
+        sendCacheStore(job.id, [...effectiveMessages, { role: 'assistant', content: text }]);
+      }
+    } catch (error) {
+      if (job?.metadata?.cacheEnabled) {
+        sendCacheDiscard(job.id);
+      }
+      const status = error.status || 500;
+      const type = status >= 500 ? 'api_error' : error.type || 'invalid_request_error';
+
+      if (stream && res.headersSent && !res.writableEnded) {
+        writeNamedSse(res, 'error', anthropicError(error.message, type));
+        res.end();
+        return;
+      }
+
+      res.status(status).json(anthropicError(error.message, type));
+    }
+  }
+
   app.disable('x-powered-by');
   app.use(express.json({ limit: '2mb' }));
   app.use('/vendor/marked', express.static(markedDir));
@@ -1909,6 +2151,10 @@ export function createBridgeServer(options = {}) {
 
   app.post('/v1/chat/completions', (req, res) => {
     handleOpenAiCompletion(req, res);
+  });
+
+  app.post('/v1/messages', (req, res) => {
+    handleAnthropicMessages(req, res);
   });
 
   app.post('/api/chat/sessions', (_req, res) => {
